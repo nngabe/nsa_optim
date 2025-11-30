@@ -1,0 +1,278 @@
+# NSA + Optimizer Ablation Study
+
+A comprehensive framework for training language models from scratch, comparing:
+- **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
+- **Optimizers**: AdamW, SOAP, Shampoo, SOAP with low-bit states
+- **Model sizes**: 0.6B, 4B, 8B, 32B (Qwen-3 architecture)
+- **Context lengths**: 32K, 128K (all), 512K, 1M (NSA only)
+
+## Overview
+
+This codebase enables systematic comparison of emerging attention mechanisms and optimizers for training large language models. It integrates:
+
+- [Native Sparse Attention](https://github.com/fla-org/native-sparse-attention) - Hardware-aligned sparse attention
+- [NVIDIA Emerging-Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers) - SOAP and Shampoo implementations
+- [HuggingFace PEFT](https://github.com/huggingface/peft) - Parameter-efficient fine-tuning utilities
+
+## Installation
+
+```bash
+# Clone this repository
+git clone <this-repo>
+cd nsa_optimizer_ablation
+
+# Run setup script
+chmod +x setup.sh
+./setup.sh
+
+# Activate environment
+source venv/bin/activate
+```
+
+## Project Structure
+
+```
+nsa_optimizer_ablation/
+├── config.py           # Configuration classes and experiment grid
+├── model.py            # Model architecture (Dense & NSA attention)
+├── optimizers.py       # Optimizer implementations (AdamW, SOAP, Shampoo)
+├── data.py             # Data loading and tokenization
+├── train.py            # Main training script
+├── run_experiments.py  # Experiment runner and job generation
+├── setup.sh            # Installation script
+├── requirements.txt    # Python dependencies
+└── README.md           # This file
+```
+
+## Experiment Grid
+
+The full ablation study covers:
+
+| Dimension | Options |
+|-----------|---------|
+| Model Size | 0.6B, 4B, 8B, 32B |
+| Attention | Dense, NSA |
+| Optimizer | AdamW, SOAP, Shampoo, SOAP-LowBit |
+| Context Length | 32K, 128K, 512K*, 1M* |
+
+*512K and 1M context lengths are only tested with NSA (native sparse attention is designed for long contexts)
+
+**Total experiments**: 128 (4 sizes × 2 attention × 4 optimizers × 4 contexts, with 512K/1M limited to NSA)
+
+## Quick Start
+
+### Single Experiment
+
+```bash
+# Train a 0.6B model with dense attention and AdamW
+python train.py \
+    --model_size 0.6B \
+    --attention_type dense \
+    --optimizer_type adamw \
+    --context_length 32768 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 4 \
+    --num_train_steps 100000 \
+    --output_dir ./outputs
+
+# Train with NSA and SOAP optimizer
+python train.py \
+    --model_size 0.6B \
+    --attention_type native_sparse_attention \
+    --optimizer_type soap \
+    --context_length 131072 \
+    --gradient_checkpointing \
+    --output_dir ./outputs
+```
+
+### Multi-GPU Training
+
+```bash
+# Using torchrun for distributed training
+torchrun --nproc_per_node=8 train.py \
+    --model_size 4B \
+    --attention_type native_sparse_attention \
+    --optimizer_type soap \
+    --context_length 131072 \
+    --batch_size 1 \
+    --gradient_accumulation_steps 16 \
+    --dtype bfloat16 \
+    --gradient_checkpointing
+```
+
+### Run All Experiments
+
+```bash
+# Generate experiment manifest
+python run_experiments.py --mode=generate
+
+# Run subset of experiments locally
+python run_experiments.py \
+    --mode=run \
+    --model_sizes 0.6B \
+    --attention_types dense native_sparse_attention \
+    --optimizer_types adamw soap \
+    --num_gpus=8
+
+# Generate SLURM scripts for cluster
+python run_experiments.py \
+    --mode=slurm \
+    --partition=gpu \
+    --account=myaccount \
+    --time_limit=48:00:00
+```
+
+## Model Architecture
+
+Models follow the Qwen-3 architecture:
+
+| Size | Hidden | Layers | Heads | KV Heads | Intermediate |
+|------|--------|--------|-------|----------|--------------|
+| 0.6B | 1024   | 28     | 16    | 8        | 3072         |
+| 4B   | 2560   | 36     | 32    | 8        | 9216         |
+| 8B   | 4096   | 36     | 32    | 8        | 12288        |
+| 32B  | 5120   | 64     | 40    | 8        | 25600        |
+
+### Attention Mechanisms
+
+**Dense Attention**: Standard multi-head attention with FlashAttention-2 backend. O(n²) complexity.
+
+**Native Sparse Attention (NSA)**: Hardware-aligned sparse attention combining:
+- Block-level top-k attention selection
+- Sliding window attention
+- Gated combination of selected and window attention
+- Near-linear complexity for long sequences
+
+### Optimizers
+
+**AdamW**: Standard adaptive optimizer with decoupled weight decay.
+
+**SOAP**: ShampoO with Adam in Preconditioner eigenbasis. Combines:
+- Kronecker-factored preconditioning from Shampoo
+- Adam-style updates in the eigenbasis
+- Periodic eigenbasis updates
+
+**Shampoo**: Full matrix preconditioning with Kronecker factorization.
+
+**SOAP-LowBit**: SOAP with 4-bit quantized optimizer states for memory efficiency.
+
+## Configuration
+
+### Training Config
+
+```python
+TrainingConfig(
+    model_size=ModelSize.SMALL,       # 0.6B, 4B, 8B, 32B
+    attention_type=AttentionType.NSA, # dense, native_sparse_attention
+    optimizer_type=OptimizerType.SOAP,
+    max_seq_length=131072,            # Context length
+    batch_size=1,
+    gradient_accumulation_steps=16,
+    num_train_steps=100000,
+    warmup_steps=2000,
+    dtype="bfloat16",
+    gradient_checkpointing=True,
+)
+```
+
+### Optimizer Config
+
+```python
+OptimizerConfig(
+    optimizer_type=OptimizerType.SOAP,
+    learning_rate=1e-4,
+    weight_decay=0.1,
+    beta1=0.9,
+    beta2=0.95,
+    precondition_frequency=10,  # SOAP/Shampoo specific
+    shampoo_beta=0.95,          # Kronecker factor EMA
+    max_precond_dim=8192,       # Max dimension for preconditioning
+)
+```
+
+## Memory Estimates
+
+Approximate GPU memory requirements (A100 80GB):
+
+| Model | Dense 32K | Dense 128K | NSA 32K | NSA 128K | NSA 512K | NSA 1M |
+|-------|-----------|------------|---------|----------|----------|--------|
+| 0.6B  | 8GB       | 20GB       | 6GB     | 12GB     | 25GB     | 45GB   |
+| 4B    | 25GB      | 60GB       | 20GB    | 40GB     | 70GB     | 140GB* |
+| 8B    | 45GB      | OOM        | 35GB    | 65GB     | 120GB*   | 220GB* |
+| 32B   | 160GB*    | OOM        | 140GB*  | 200GB*   | 350GB*   | 600GB* |
+
+*Requires multi-GPU with model parallelism
+
+## Monitoring
+
+Training logs to wandb by default:
+
+```bash
+# Set wandb project
+export WANDB_PROJECT=nsa-optimizer-ablation
+
+# View experiments
+wandb login
+```
+
+Logged metrics:
+- `train/loss`: Training loss
+- `train/lr`: Learning rate
+- `train/tokens_per_sec`: Throughput
+- `train/grad_norm`: Gradient norm
+- `eval/loss`: Evaluation loss
+- `eval/perplexity`: Evaluation perplexity
+
+## Checkpointing
+
+Checkpoints are saved to `{output_dir}/{run_name}/checkpoint-{step}/`:
+- `model.pt`: Model weights
+- `optimizer.pt`: Optimizer state
+- `scheduler.pt`: LR scheduler state
+- `config.json`: Training configuration
+
+Resume training:
+```bash
+python train.py \
+    --resume_from ./outputs/my_run/checkpoint-50000 \
+    ...
+```
+
+## Key Findings (Expected)
+
+Based on the literature, expected findings include:
+
+1. **NSA vs Dense**: NSA should show similar quality with 2-4x memory efficiency at long contexts
+2. **SOAP vs AdamW**: SOAP typically converges 1.5-2x faster in wall-clock time
+3. **Shampoo vs SOAP**: Similar convergence, SOAP slightly more stable
+4. **Low-bit SOAP**: ~2x memory reduction with minimal quality loss
+
+## Citation
+
+If you use this code, please cite the relevant papers:
+
+```bibtex
+@inproceedings{yuan2025nsa,
+  title={Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention},
+  author={Yuan, Jingyang and others},
+  year={2025}
+}
+
+@inproceedings{vyas2024soap,
+  title={SOAP: Improving and Stabilizing Shampoo using Adam},
+  author={Vyas, Nikhil and others},
+  booktitle={ICLR},
+  year={2025}
+}
+
+@article{gupta2018shampoo,
+  title={Shampoo: Preconditioned Stochastic Tensor Optimization},
+  author={Gupta, Vineet and others},
+  journal={ICML},
+  year={2018}
+}
+```
+
+## License
+
+Apache 2.0

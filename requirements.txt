@@ -1,0 +1,43 @@
+# Core dependencies
+torch>=2.2.0
+transformers>=4.40.0
+datasets>=2.18.0
+tokenizers>=0.15.0
+
+# Training utilities
+accelerate>=0.28.0
+deepspeed>=0.14.0
+wandb>=0.16.0
+
+# Optimizers
+# NVIDIA Emerging-Optimizers (install from source)
+# git clone https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git
+# cd Emerging-Optimizers && pip install .
+
+# Facebook Distributed Shampoo (install from source)
+# git clone https://github.com/facebookresearch/optimizers.git
+# cd optimizers && pip install .
+
+# Low-bit optimizers
+# git clone https://github.com/thu-ml/low-bit-optimizers.git
+# cd low-bit-optimizers && pip install .
+torchao>=0.3.0
+bitsandbytes>=0.43.0
+
+# Native Sparse Attention (install from source)
+# git clone https://github.com/fla-org/native-sparse-attention.git
+# cd native-sparse-attention
+# git submodule update --init --recursive
+# pip install .
+
+# Flash Attention (optional, for dense attention baseline)
+flash-attn>=2.5.0
+
+# Triton for custom kernels
+triton>=2.2.0
+
+# Utilities
+einops>=0.7.0
+numpy>=1.24.0
+tqdm>=4.65.0
+pyyaml>=6.0

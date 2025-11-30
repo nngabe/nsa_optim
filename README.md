@@ -32,7 +32,7 @@ This codebase enables systematic comparison of emerging attention mechanisms and
 ```bash
 # Clone this repository
 git clone https://github.com/nngabe/nsa_optim.git
-cd nsa_optimizer_ablation
+cd nsa_optim
 
 # Run setup script
 chmod +x setup.sh

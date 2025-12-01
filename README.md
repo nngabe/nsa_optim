@@ -8,7 +8,7 @@ This repository contains experiments for efficient training of foundation models
 
 ## Overview
 
-This repo systematically compares emerging attention mechanisms and optimizers for training large language models. It integrates:
+We compare efficient architectures, attention mechanisms, and optimizers for training LLMs. Specifically, we investigate usage of the following compute/parameter efficient methods:
 
 - [Native Sparse Attention](https://github.com/fla-org/native-sparse-attention) - Hardware-aligned sparse attention
 - [NVIDIA Emerging-Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers) - SOAP and Shampoo implementations

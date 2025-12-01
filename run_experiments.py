@@ -190,11 +190,11 @@ def generate_experiment_manifest(experiments: List[TrainingConfig], output_dir: 
         "total_experiments": len(experiments),
         "experiments": []
     }
-    
+
     for config in experiments:
         exp_name = generate_experiment_name(config)
         resources = estimate_resources(config)
-        
+
         manifest["experiments"].append({
             "name": exp_name,
             "model_size": config.model_size.value,
@@ -206,8 +206,10 @@ def generate_experiment_manifest(experiments: List[TrainingConfig], output_dir: 
             "num_train_steps": config.num_train_steps,
             "estimated_resources": resources,
         })
-    
-    manifest_path = Path(output_dir) / "experiment_manifest.json"
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / "experiment_manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     

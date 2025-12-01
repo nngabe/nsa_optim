@@ -55,14 +55,17 @@ class RotaryEmbedding(nn.Module):
         seq_len = x.shape[1]
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len)
-        
+
         if position_ids is not None:
+            # Handle both 1D and 2D position_ids
+            if position_ids.dim() == 2:
+                position_ids = position_ids.squeeze(0)
             cos = self.cos_cached[position_ids]
             sin = self.sin_cached[position_ids]
         else:
             cos = self.cos_cached[:seq_len]
             sin = self.sin_cached[:seq_len]
-        
+
         return cos, sin
 
 
@@ -410,20 +413,29 @@ class TransformerModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        
+        self.gradient_checkpointing = False
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
             TransformerBlock(config, layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
+
         if config.tie_word_embeddings:
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
+
         self._init_weights()
+
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for this model"""
+        self.gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing for this model"""
+        self.gradient_checkpointing = False
 
     def _init_weights(self):
         """Initialize weights with small random values"""
@@ -446,25 +458,48 @@ class TransformerModel(nn.Module):
         labels: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[List]]:
         batch_size, seq_len = input_ids.shape
-        
+
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
-        
+
         hidden_states = self.embed_tokens(input_ids)
-        
+
+        # Gradient checkpointing is incompatible with caching
+        if self.gradient_checkpointing and use_cache:
+            use_cache = False
+
         new_cache = []
         for i, layer in enumerate(self.layers):
             past = past_key_values[i] if past_key_values else None
-            hidden_states, cache = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past,
-                use_cache=use_cache,
-            )
+
+            if self.gradient_checkpointing and self.training:
+                # Use gradient checkpointing
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+
+                hidden_states, cache = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    past,
+                    use_cache,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states, cache = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past,
+                    use_cache=use_cache,
+                )
+
             if use_cache:
                 new_cache.append(cache)
-        
+
         hidden_states = self.norm(hidden_states)
         
         if self.lm_head is not None:

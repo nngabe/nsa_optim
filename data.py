@@ -22,7 +22,7 @@ class DataConfig:
     tokenizer_path: str = "Qwen/Qwen3-0.6B"
     max_seq_length: int = 32768
     batch_size: int = 1
-    num_workers: int = 4
+    num_workers: int = 0  # Set to 0 to avoid multi-process tokenizer loading overhead
     prefetch_factor: int = 2
     streaming: bool = True
     seed: int = 42
@@ -102,11 +102,11 @@ class TokenizedDataset(IterableDataset):
                 
                 input_ids = torch.tensor(seq, dtype=torch.long)
                 labels = input_ids.clone()
-                
+
                 yield {
                     "input_ids": input_ids,
                     "labels": labels,
-                    "attention_mask": torch.ones_like(input_ids),
+                    "attention_mask": torch.ones_like(input_ids, dtype=torch.bool),
                 }
 
 
@@ -134,20 +134,27 @@ class PackedDataset(IterableDataset):
         self.seed = seed
         self.split = split
         self.pack_sequences = pack_sequences
-        
+
         self._dataset = None
-        
+
         # Get special token ids
         self.bos_token_id = tokenizer.bos_token_id
         self.eos_token_id = tokenizer.eos_token_id or tokenizer.bos_token_id
         self.pad_token_id = tokenizer.pad_token_id or self.eos_token_id
 
+        # Validate that we have valid token IDs
+        if self.pad_token_id is None:
+            raise ValueError(
+                "Tokenizer does not have pad_token_id, eos_token_id, or bos_token_id set. "
+                "Please ensure the tokenizer has at least one special token defined."
+            )
+
     def _load_dataset(self):
         if self._dataset is not None:
             return
-        
+
         from datasets import load_dataset
-        
+
         if self.streaming:
             self._dataset = load_dataset(
                 self.dataset_name,
@@ -193,9 +200,9 @@ class PackedDataset(IterableDataset):
                 attention_mask = [1] * self.max_seq_length
             
             input_ids = torch.tensor(tokens[:self.max_seq_length], dtype=torch.long)
-            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+            attention_mask = torch.tensor(attention_mask, dtype=torch.bool)
             labels = input_ids.clone()
-            labels[attention_mask == 0] = -100  # Ignore padding in loss
+            labels[~attention_mask] = -100  # Ignore padding in loss
             
             yield {
                 "input_ids": input_ids,
@@ -211,9 +218,14 @@ class PackedDataset(IterableDataset):
         for example in self._dataset:
             text = example.get("text", example.get("content", ""))
             tokens = self.tokenizer.encode(text, add_special_tokens=False)
-            
-            # Add document markers
-            doc_tokens = [self.bos_token_id] + tokens + [self.eos_token_id]
+
+            # Add document markers (only if token IDs are not None)
+            doc_tokens = []
+            if self.bos_token_id is not None:
+                doc_tokens.append(self.bos_token_id)
+            doc_tokens.extend(tokens)
+            if self.eos_token_id is not None:
+                doc_tokens.append(self.eos_token_id)
             
             # Skip very long documents
             if len(doc_tokens) > self.max_seq_length:
@@ -224,10 +236,10 @@ class PackedDataset(IterableDataset):
                 doc_boundaries.append(len(buffer))
                 buffer.extend(doc_tokens)
             else:
-                # Yield current buffer
+                # Yield current buffer (pad if not empty)
                 if buffer:
-                    yield self._create_packed_batch(buffer, doc_boundaries)
-                
+                    yield self._create_packed_batch(buffer, doc_boundaries, pad=True)
+
                 # Start new buffer
                 buffer = doc_tokens
                 doc_boundaries = [0]
@@ -247,25 +259,25 @@ class PackedDataset(IterableDataset):
             yield self._create_packed_batch(buffer, doc_boundaries, pad=True)
 
     def _create_packed_batch(
-        self, 
-        tokens: List[int], 
+        self,
+        tokens: List[int],
         doc_boundaries: List[int],
         pad: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Create batch from packed tokens"""
         seq_len = len(tokens)
-        
+
         if pad and seq_len < self.max_seq_length:
             padding_length = self.max_seq_length - seq_len
             tokens = tokens + [self.pad_token_id] * padding_length
             attention_mask = [1] * seq_len + [0] * padding_length
         else:
             attention_mask = [1] * len(tokens)
-        
+
         input_ids = torch.tensor(tokens[:self.max_seq_length], dtype=torch.long)
-        attention_mask = torch.tensor(attention_mask[:self.max_seq_length], dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask[:self.max_seq_length], dtype=torch.bool)
         labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
+        labels[~attention_mask] = -100
         
         return {
             "input_ids": input_ids,
@@ -320,14 +332,20 @@ def create_dataloader(
 def get_tokenizer(tokenizer_path: str):
     """Load tokenizer"""
     from transformers import AutoTokenizer
-    
+
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path,
         trust_remote_code=True,
     )
-    
-    # Ensure padding token is set
+
+    # Ensure special tokens are set
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        elif tokenizer.bos_token_id is not None:
+            tokenizer.pad_token_id = tokenizer.bos_token_id
+        else:
+            # Fallback to vocab size - 1 if no special tokens exist
+            tokenizer.pad_token_id = tokenizer.vocab_size - 1
+
     return tokenizer

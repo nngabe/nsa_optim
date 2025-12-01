@@ -345,7 +345,7 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
     
     # Load tokenizer
     tokenizer = get_tokenizer("Qwen/Qwen3-0.6B")
-    
+
     # Setup model
     if is_main:
         print(f"Setting up model: {config.model_size.value} with {config.attention_type.value}")
@@ -385,9 +385,9 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
         batch_size=config.batch_size,
         streaming=True,
     )
-    
+
     train_dataloader = create_dataloader(data_config, tokenizer, rank, world_size)
-    
+
     # Setup AMP
     dtype = getattr(torch, config.dtype)
     use_amp = dtype in (torch.float16, torch.bfloat16)
@@ -410,13 +410,13 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
         print(f"Batch size: {config.batch_size} x {world_size} x {config.gradient_accumulation_steps}")
         print(f"Effective batch size: {config.batch_size * world_size * config.gradient_accumulation_steps}")
         print(f"Context length: {config.max_seq_length}")
-    
+
     data_iter = iter(train_dataloader)
     step = start_step
     grad_accum_step = 0
     running_loss = 0.0
     start_time = time.time()
-    
+
     while step < config.num_train_steps:
         # Get next batch
         try:

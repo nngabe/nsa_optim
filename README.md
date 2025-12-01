@@ -1,6 +1,6 @@
 # NSA + Optimizer Ablation Study
 
-This repository contains experiments for efficient training of foundation models. In particular, we experiment with LLM training ablations on:
+This repository contains experiments for efficient training of foundation models. In particular, we experiment with LLM training and the following ablations:
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
 - **Optimizers**: AdamW, SOAP, Shampoo, SOAP with low-bit states
 - **Model sizes**: 0.6B, 4B, 8B, 32B (Qwen-3 architecture)

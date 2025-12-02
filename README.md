@@ -238,7 +238,7 @@ python train.py \
     ...
 ```
 
-## Key Findings (Expected)
+## Results
 
 Based on the literature, expected findings include:
 
@@ -272,6 +272,90 @@ If you use this code, please cite the relevant papers:
   year={2018}
 }
 ```
+
+## CI/CD with GitLab
+
+The project includes comprehensive GitLab CI/CD integration for automated testing, training, and deployment.
+
+### Pipeline Stages
+
+| Stage | Jobs | Purpose |
+|-------|------|---------|
+| `lint` | ruff, mypy, black | Code quality checks |
+| `test` | unit, config, model, optimizers | Automated testing |
+| `build` | docker, package | Build containers and packages |
+| `train-smoke` | smoke-dense-adamw, smoke-nsa-soap | Quick validation (100 steps) |
+| `train-experiments` | Full experiment matrix | Complete ablation study |
+| `analyze` | results, compare-* | Result aggregation |
+| `deploy` | model-registry, pages | Upload models, docs |
+
+### Running the Pipeline
+
+```bash
+# Trigger smoke tests on every MR/push to main
+# Full experiments require manual trigger or variables:
+
+# Run all experiments
+git push -o ci.variable="RUN_FULL_EXPERIMENTS=true"
+
+# Run batch experiments (matrix)
+git push -o ci.variable="RUN_BATCH_EXPERIMENTS=true"
+
+# Deploy models to HuggingFace
+git push -o ci.variable="DEPLOY_MODELS=true" -o ci.variable="HF_TOKEN=xxx"
+```
+
+### Required GitLab CI Variables
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `CI_REGISTRY_*` | Container registry credentials | Auto-set |
+| `HF_TOKEN` | HuggingFace API token | For deployment |
+| `HF_REPO_ID` | Target HuggingFace repo | For deployment |
+| `WANDB_API_KEY` | Weights & Biases key | Optional |
+
+### GPU Runners
+
+The pipeline requires GitLab runners with GPU support for training jobs. Tag your runners with:
+- `gpu` - Has NVIDIA GPU
+- `cuda` - CUDA toolkit installed
+
+### Scheduled Pipelines
+
+Configure in GitLab CI/CD → Schedules:
+
+| Schedule | Variable | Frequency |
+|----------|----------|-----------|
+| Nightly smoke | `SCHEDULE_TYPE=nightly` | Daily |
+| Weekly experiments | `SCHEDULE_TYPE=weekly` | Weekly |
+
+### Local Testing
+
+```bash
+# Run tests locally
+pytest tests/unit/ -v
+
+# Run linting
+ruff check .
+black --check .
+mypy .
+
+# Build Docker image locally
+docker build -t nsa-ablation .
+```
+
+### Docker Image
+
+The CI builds a Docker image with all dependencies:
+
+```bash
+# Pull from GitLab registry
+docker pull $CI_REGISTRY_IMAGE:latest
+
+# Run training in container
+docker run --gpus all -v $(pwd)/outputs:/app/outputs \
+    $CI_REGISTRY_IMAGE:latest \
+    python train.py --model_size 0.6B --attention_type nsa
 
 ## License
 

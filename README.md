@@ -356,7 +356,3 @@ docker pull $CI_REGISTRY_IMAGE:latest
 docker run --gpus all -v $(pwd)/outputs:/app/outputs \
     $CI_REGISTRY_IMAGE:latest \
     python train.py --model_size 0.6B --attention_type nsa
-
-## License
-
-Apache 2.0

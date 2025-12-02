@@ -1,0 +1,555 @@
+# GitLab CI/CD Pipeline for NSA + Optimizer Ablation Study
+# 
+# This pipeline provides:
+# - Code quality checks (linting, type checking)
+# - Unit tests for core components
+# - Integration tests on small models
+# - Experiment execution on GPU runners
+# - Artifact collection and model registry
+
+stages:
+  - lint
+  - test
+  - build
+  - train-smoke
+  - train-experiments
+  - analyze
+  - deploy
+
+# Global variables
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  TORCH_HOME: "$CI_PROJECT_DIR/.torch-cache"
+  HF_HOME: "$CI_PROJECT_DIR/.hf-cache"
+  WANDB_MODE: "offline"  # Don't sync during CI, upload artifacts instead
+  PYTHONUNBUFFERED: "1"
+
+# Cache configuration for faster builds
+.pip-cache: &pip-cache
+  cache:
+    key: pip-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .pip-cache/
+      - .torch-cache/
+      - .hf-cache/
+    policy: pull-push
+
+# Default image for non-GPU jobs
+default:
+  image: python:3.11-slim
+  before_script:
+    - pip install --upgrade pip
+
+# ==============================================================================
+# STAGE: Lint - Code quality checks
+# ==============================================================================
+
+lint:ruff:
+  stage: lint
+  <<: *pip-cache
+  script:
+    - pip install ruff
+    - ruff check . --output-format=gitlab
+  allow_failure: true
+  artifacts:
+    reports:
+      codequality: gl-code-quality-report.json
+
+lint:mypy:
+  stage: lint
+  <<: *pip-cache
+  script:
+    - pip install mypy torch types-PyYAML
+    - mypy --install-types --non-interactive --ignore-missing-imports *.py
+  allow_failure: true
+
+lint:black:
+  stage: lint
+  <<: *pip-cache
+  script:
+    - pip install black
+    - black --check --diff .
+  allow_failure: true
+
+# ==============================================================================
+# STAGE: Test - Unit and integration tests
+# ==============================================================================
+
+test:unit:
+  stage: test
+  <<: *pip-cache
+  script:
+    - pip install pytest pytest-cov torch transformers datasets
+    - pytest tests/unit/ -v --cov=. --cov-report=xml --cov-report=term
+  coverage: '/TOTAL.*\s+(\d+%)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - coverage.xml
+    expire_in: 1 week
+
+test:config:
+  stage: test
+  <<: *pip-cache
+  script:
+    - pip install pytest torch
+    - python -c "from config import get_experiment_grid; exps = get_experiment_grid(); print(f'Generated {len(exps)} experiments')"
+    - python -c "from config import MODEL_CONFIGS, ModelSize; print('Model configs:', list(MODEL_CONFIGS.keys()))"
+
+test:model:
+  stage: test
+  <<: *pip-cache
+  image: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+  tags:
+    - gpu  # Requires GPU runner
+  script:
+    - pip install transformers einops
+    - python -c "
+      import torch
+      from config import MODEL_CONFIGS, ModelSize, AttentionType
+      from model import create_model
+      
+      # Test small model creation
+      config = MODEL_CONFIGS[ModelSize.SMALL]
+      config.max_position_embeddings = 2048
+      
+      # Test dense attention
+      config.attention_type = AttentionType.DENSE
+      model = create_model(config)
+      x = torch.randint(0, 1000, (1, 128))
+      out, loss, _ = model(x, labels=x)
+      print(f'Dense model output shape: {out.shape}, loss: {loss.item():.4f}')
+      
+      # Test NSA attention
+      config.attention_type = AttentionType.NSA
+      model = create_model(config)
+      out, loss, _ = model(x, labels=x)
+      print(f'NSA model output shape: {out.shape}, loss: {loss.item():.4f}')
+      print('Model tests passed!')
+      "
+  allow_failure: true  # GPU may not be available
+
+test:optimizers:
+  stage: test
+  <<: *pip-cache
+  script:
+    - pip install torch
+    - python -c "
+      import torch
+      import torch.nn as nn
+      from config import OptimizerConfig, OptimizerType
+      from optimizers import create_optimizer
+      
+      # Simple model for testing
+      model = nn.Linear(10, 10)
+      
+      # Test each optimizer type
+      for opt_type in OptimizerType:
+          config = OptimizerConfig(optimizer_type=opt_type, learning_rate=1e-3)
+          try:
+              optimizer = create_optimizer(model, config)
+              print(f'{opt_type.value}: {type(optimizer).__name__}')
+          except ImportError as e:
+              print(f'{opt_type.value}: Skipped (missing dependency)')
+      print('Optimizer tests passed!')
+      "
+
+# ==============================================================================
+# STAGE: Build - Create Docker images and packages
+# ==============================================================================
+
+build:docker:
+  stage: build
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA -f Dockerfile .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE:latest
+        docker push $CI_REGISTRY_IMAGE:latest
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+
+build:package:
+  stage: build
+  <<: *pip-cache
+  script:
+    - pip install build twine
+    - python -m build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+# ==============================================================================
+# STAGE: Train Smoke Tests - Quick validation on small models
+# ==============================================================================
+
+.train-template: &train-template
+  image: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  tags:
+    - gpu
+    - cuda
+  timeout: 4h
+  artifacts:
+    paths:
+      - outputs/
+      - wandb/
+    expire_in: 1 month
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+train:smoke-dense-adamw:
+  stage: train-smoke
+  <<: *train-template
+  script:
+    - python train.py
+        --model_size 0.6B
+        --attention_type dense
+        --optimizer_type adamw
+        --context_length 2048
+        --batch_size 4
+        --gradient_accumulation_steps 1
+        --num_train_steps 100
+        --warmup_steps 10
+        --dtype bfloat16
+        --output_dir outputs/smoke-dense-adamw
+        --run_name smoke-dense-adamw
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+train:smoke-nsa-soap:
+  stage: train-smoke
+  <<: *train-template
+  script:
+    - python train.py
+        --model_size 0.6B
+        --attention_type native_sparse_attention
+        --optimizer_type soap
+        --context_length 2048
+        --batch_size 4
+        --gradient_accumulation_steps 1
+        --num_train_steps 100
+        --warmup_steps 10
+        --dtype bfloat16
+        --gradient_checkpointing
+        --output_dir outputs/smoke-nsa-soap
+        --run_name smoke-nsa-soap
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ==============================================================================
+# STAGE: Train Experiments - Full ablation study (manual trigger)
+# ==============================================================================
+
+# Template for full experiments
+.experiment-template: &experiment-template
+  stage: train-experiments
+  <<: *train-template
+  timeout: 72h
+  rules:
+    - if: $RUN_FULL_EXPERIMENTS == "true"
+    - if: $CI_COMMIT_TAG
+    - when: manual
+      allow_failure: true
+
+# Small model experiments (0.6B)
+train:0.6B-dense-adamw-32k:
+  <<: *experiment-template
+  variables:
+    MODEL_SIZE: "0.6B"
+    ATTENTION: "dense"
+    OPTIMIZER: "adamw"
+    CONTEXT: "32768"
+  script:
+    - python train.py
+        --model_size $MODEL_SIZE
+        --attention_type $ATTENTION
+        --optimizer_type $OPTIMIZER
+        --context_length $CONTEXT
+        --batch_size 4
+        --gradient_accumulation_steps 4
+        --num_train_steps 50000
+        --warmup_steps 1000
+        --dtype bfloat16
+        --gradient_checkpointing
+        --output_dir outputs/${MODEL_SIZE}-${ATTENTION}-${OPTIMIZER}-ctx${CONTEXT}
+        --run_name ${MODEL_SIZE}-${ATTENTION}-${OPTIMIZER}-ctx${CONTEXT}
+
+train:0.6B-nsa-soap-32k:
+  <<: *experiment-template
+  variables:
+    MODEL_SIZE: "0.6B"
+    ATTENTION: "native_sparse_attention"
+    OPTIMIZER: "soap"
+    CONTEXT: "32768"
+  script:
+    - python train.py
+        --model_size $MODEL_SIZE
+        --attention_type $ATTENTION
+        --optimizer_type $OPTIMIZER
+        --context_length $CONTEXT
+        --batch_size 4
+        --gradient_accumulation_steps 4
+        --num_train_steps 50000
+        --warmup_steps 1000
+        --dtype bfloat16
+        --gradient_checkpointing
+        --output_dir outputs/${MODEL_SIZE}-${ATTENTION}-${OPTIMIZER}-ctx${CONTEXT}
+        --run_name ${MODEL_SIZE}-${ATTENTION}-${OPTIMIZER}-ctx${CONTEXT}
+
+train:0.6B-nsa-soap-128k:
+  <<: *experiment-template
+  variables:
+    MODEL_SIZE: "0.6B"
+    ATTENTION: "native_sparse_attention"
+    OPTIMIZER: "soap"
+    CONTEXT: "131072"
+  script:
+    - python train.py
+        --model_size $MODEL_SIZE
+        --attention_type $ATTENTION
+        --optimizer_type $OPTIMIZER
+        --context_length $CONTEXT
+        --batch_size 1
+        --gradient_accumulation_steps 16
+        --num_train_steps 25000
+        --warmup_steps 500
+        --dtype bfloat16
+        --gradient_checkpointing
+        --output_dir outputs/${MODEL_SIZE}-${ATTENTION}-${OPTIMIZER}-ctx${CONTEXT}
+        --run_name ${MODEL_SIZE}-${ATTENTION}-${OPTIMIZER}-ctx${CONTEXT}
+
+# Dynamic experiment generation (runs all experiments from manifest)
+train:batch-experiments:
+  stage: train-experiments
+  <<: *train-template
+  timeout: 168h  # 1 week
+  parallel:
+    matrix:
+      - MODEL_SIZE: ["0.6B", "4B"]
+        ATTENTION: ["dense", "native_sparse_attention"]
+        OPTIMIZER: ["adamw", "soap", "shampoo", "soap_lowbit"]
+        CONTEXT: ["32768", "131072"]
+  script:
+    - |
+      # Skip invalid combinations (512k/1M only for NSA)
+      if [[ "$CONTEXT" -gt 131072 ]] && [[ "$ATTENTION" == "dense" ]]; then
+        echo "Skipping: Dense attention doesn't support context > 128k"
+        exit 0
+      fi
+    - python train.py
+        --model_size $MODEL_SIZE
+        --attention_type $ATTENTION
+        --optimizer_type $OPTIMIZER
+        --context_length $CONTEXT
+        --batch_size 1
+        --gradient_accumulation_steps 16
+        --num_train_steps 50000
+        --warmup_steps 1000
+        --dtype bfloat16
+        --gradient_checkpointing
+        --output_dir outputs/${MODEL_SIZE}-${ATTENTION}-${OPTIMIZER}-ctx${CONTEXT}
+        --run_name ${MODEL_SIZE}-${ATTENTION}-${OPTIMIZER}-ctx${CONTEXT}
+  rules:
+    - if: $RUN_BATCH_EXPERIMENTS == "true"
+    - when: manual
+      allow_failure: true
+
+# ==============================================================================
+# STAGE: Analyze - Aggregate and compare results
+# ==============================================================================
+
+analyze:results:
+  stage: analyze
+  image: python:3.11
+  needs:
+    - train:smoke-dense-adamw
+    - train:smoke-nsa-soap
+  script:
+    - pip install numpy matplotlib
+    - python analysis.py
+        --output_dir outputs/
+        --report_path analysis_report.json
+        --plot
+  artifacts:
+    paths:
+      - analysis_report.json
+      - training_curves.png
+    reports:
+      metrics: analysis_report.json
+    expire_in: 3 months
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $RUN_FULL_EXPERIMENTS == "true"
+
+analyze:compare-attention:
+  stage: analyze
+  image: python:3.11
+  script:
+    - pip install numpy pandas
+    - python -c "
+      from analysis import load_experiment_results, compare_attention_types
+      import json
+      
+      results = load_experiment_results('outputs/')
+      comparison = compare_attention_types(results)
+      
+      print('Attention Type Comparison:')
+      for attn_type, stats in comparison.items():
+          print(f'{attn_type}:')
+          print(f'  Loss: {stats[\"loss\"][\"mean\"]:.4f} ± {stats[\"loss\"][\"std\"]:.4f}')
+          print(f'  Throughput: {stats[\"throughput\"][\"mean\"]:.0f} tok/s')
+          print(f'  Memory: {stats[\"memory\"][\"mean\"]:.1f} GB')
+      
+      with open('attention_comparison.json', 'w') as f:
+          json.dump(comparison, f, indent=2)
+      "
+  artifacts:
+    paths:
+      - attention_comparison.json
+    expire_in: 3 months
+  rules:
+    - if: $RUN_FULL_EXPERIMENTS == "true"
+  allow_failure: true
+
+analyze:compare-optimizers:
+  stage: analyze
+  image: python:3.11
+  script:
+    - pip install numpy pandas
+    - python -c "
+      from analysis import load_experiment_results, compare_optimizers
+      import json
+      
+      results = load_experiment_results('outputs/')
+      comparison = compare_optimizers(results)
+      
+      print('Optimizer Comparison:')
+      for opt_type, stats in comparison.items():
+          print(f'{opt_type}:')
+          print(f'  Loss: {stats[\"loss\"][\"mean\"]:.4f} ± {stats[\"loss\"][\"std\"]:.4f}')
+          print(f'  Time: {stats[\"training_time\"][\"mean\"]:.1f}h')
+      
+      with open('optimizer_comparison.json', 'w') as f:
+          json.dump(comparison, f, indent=2)
+      "
+  artifacts:
+    paths:
+      - optimizer_comparison.json
+    expire_in: 3 months
+  rules:
+    - if: $RUN_FULL_EXPERIMENTS == "true"
+  allow_failure: true
+
+# ==============================================================================
+# STAGE: Deploy - Upload models and results
+# ==============================================================================
+
+deploy:model-registry:
+  stage: deploy
+  image: python:3.11
+  script:
+    - pip install huggingface_hub
+    - |
+      # Upload best models to HuggingFace Hub (if HF_TOKEN is set)
+      if [ -n "$HF_TOKEN" ]; then
+        python -c "
+        from huggingface_hub import HfApi
+        import os
+        import json
+        
+        api = HfApi(token=os.environ['HF_TOKEN'])
+        
+        # Find best checkpoint by loss
+        best_loss = float('inf')
+        best_path = None
+        
+        for exp_dir in os.listdir('outputs'):
+            config_path = f'outputs/{exp_dir}/config.json'
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    config = json.load(f)
+                    if config.get('final_loss', float('inf')) < best_loss:
+                        best_loss = config['final_loss']
+                        best_path = f'outputs/{exp_dir}'
+        
+        if best_path:
+            print(f'Uploading best model from {best_path} (loss={best_loss:.4f})')
+            api.upload_folder(
+                folder_path=best_path,
+                repo_id='$HF_REPO_ID',
+                repo_type='model',
+            )
+        "
+      fi
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $DEPLOY_MODELS == "true"
+  allow_failure: true
+
+deploy:pages:
+  stage: deploy
+  image: python:3.11
+  script:
+    - pip install mkdocs mkdocs-material
+    - mkdocs build -d public
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  allow_failure: true
+
+# ==============================================================================
+# Scheduled Pipelines
+# ==============================================================================
+
+# Nightly smoke tests
+nightly:smoke:
+  stage: train-smoke
+  <<: *train-template
+  script:
+    - python run_experiments.py
+        --mode=run
+        --model_sizes 0.6B
+        --attention_types dense native_sparse_attention
+        --optimizer_types adamw soap
+        --context_lengths 32768
+        --num_gpus 1
+        --dry_run false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "nightly"
+
+# Weekly full experiments (subset)
+weekly:experiments:
+  stage: train-experiments
+  <<: *train-template
+  timeout: 48h
+  script:
+    - python run_experiments.py
+        --mode=run
+        --model_sizes 0.6B 4B
+        --attention_types dense native_sparse_attention
+        --optimizer_types adamw soap shampoo
+        --context_lengths 32768 131072
+        --num_gpus 8
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_TYPE == "weekly"

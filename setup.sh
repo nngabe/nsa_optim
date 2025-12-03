@@ -19,14 +19,14 @@ pip install --upgrade pip setuptools wheel
 
 # Install core dependencies
 echo "Installing core dependencies..."
-# Install PyTorch 2.9.1 with CUDA 12.8 for Blackwell (sm_120) support
-pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu128 
-pip install "transformers>=4.40.0" "datasets>=2.18.0" "tokenizers>=0.15.0"
-pip install "accelerate>=0.28.0" "wandb>=0.16.0" "einops>=0.7.0"
+# Install PyTorch 2.9.1 with CUDA 13.0 for Blackwell (sm_120) support
+pip install torch==2.9.1 torchvision torchao --index-url https://download.pytorch.org/whl/cu130
+pip install "transformers>=4.40.0" "datasets>=2.18.0" "tokenizers>=0.15.0" "bitsandbytes>=0.43.0"
+pip install "accelerate>=0.28.0" "wandb>=0.16.0" "einops>=0.7.0" "peft>=0.10.0"
 
 # Install Triton
 echo "Installing Triton..."
-pip install "triton>=2.2.0"
+pip install "triton>=3.3.0"
 
 # Install ninja (required for some CUDA extensions)
 echo "Installing ninja..."
@@ -35,12 +35,6 @@ pip install ninja
 # Try to install Flash Attention
 echo "Installing Flash Attention..."
 pip install flash-attn --no-build-isolation 2>/dev/null || echo "Warning: Flash Attention installation failed, will use PyTorch SDPA"
-
-# Install torchao and bitsandbytes for low-bit optimizers
-echo "Installing low-bit optimizer dependencies..."
-# Install torchao matching PyTorch 2.7.0 with CUDA 12.8
-pip install torchao --index-url https://download.pytorch.org/whl/cu128
-pip install "bitsandbytes>=0.43.0" || echo "Warning: bitsandbytes installation failed"
 
 # Clone and install Native Sparse Attention
 echo "Installing Native Sparse Attention..."
@@ -82,10 +76,6 @@ else
     pip install . --no-build-isolation || echo "Warning: low-bit-optimizers installation failed"
     cd ../..
 fi
-
-# Clone PEFT (optional, for comparison)
-echo "Installing PEFT..."
-pip install "peft>=0.10.0"
 
 echo ""
 echo "=========================================="

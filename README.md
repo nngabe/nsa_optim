@@ -241,8 +241,6 @@ OptimizerConfig(
 
 ## Memory Estimates
 
-**IMPORTANT**: Memory requirements depend heavily on optimizer choice and whether gradient checkpointing is enabled.
-
 ### Memory Components (per GPU with DDP)
 
 For a model with `P` parameters:
@@ -262,58 +260,14 @@ For a model with `P` parameters:
 
 | Model | Params | Dense 32K | Dense 128K | NSA 32K | NSA 128K | NSA 512K | NSA 1M |
 |-------|--------|-----------|------------|---------|----------|----------|--------|
-| 0.6B  | 0.59B  | AdamW: 18GB<br>AdamW-8bit: 12GB | AdamW: 35GB<br>AdamW-8bit: 25GB | AdamW: 15GB<br>AdamW-8bit: 10GB | AdamW: 28GB<br>AdamW-8bit: 20GB | AdamW: 55GB<br>AdamW-8bit: 40GB | AdamW: 95GB*<br>AdamW-8bit: 70GB* |
-| 4B    | 3.92B  | AdamW: 55GB<br>AdamW-8bit: 35GB | AdamW: 95GB*<br>AdamW-8bit: 65GB | AdamW: 48GB<br>AdamW-8bit: 30GB | AdamW: 80GB<br>AdamW-8bit: 55GB | AdamW: 140GB*<br>AdamW-8bit: 95GB* | OOM* |
-| 8B    | 7.62B  | AdamW: 95GB*<br>AdamW-8bit: 60GB | OOM* | AdamW: 85GB*<br>AdamW-8bit: 55GB | AdamW: 130GB*<br>AdamW-8bit: 85GB* | OOM* | OOM* |
+| 0.6B  | 0.59B  | 12GB | 25GB | 10GB | 20GB | 40GB | 70GB |
+| 4B    | 3.92B  | 35GB | 65GB | 30GB | 55GB | 95GB | OOM* |
+| 8B    | 7.62B  | 60GB | OOM* | 55GB | 85GB | OOM* | OOM* |
 | 32B   | 31.4B  | OOM* | OOM* | OOM* | OOM* | OOM* | OOM* |
 
 **Without gradient checkpointing, add 50-100% to activation memory.**
 
 *Requires multi-GPU with FSDP or pipeline parallelism
-
-### Example: 4B Model on 2×96GB GPUs
-
-**Your exact configuration** (Dense, 32K, AdamW, no gradient checkpointing):
-- Model: 7.84 GB
-- Optimizer: 31.36 GB
-- Gradients: 7.84 GB
-- Activations: ~48 GB
-- **Total: ~95 GB per GPU → OOM!**
-
-**Recommended fixes:**
-```bash
-# Option 1: Enable gradient checkpointing (recommended)
-torchrun --nproc_per_node=2 train.py \
-    --model_size 4B \
-    --optimizer_type adamw \
-    --attention_type dense \
-    --context_length 32768 \
-    --gradient_checkpointing
-
-# Option 2: Use AdamW-8bit optimizer
-torchrun --nproc_per_node=2 train.py \
-    --model_size 4B \
-    --optimizer_type adamw_8bit \
-    --attention_type dense \
-    --context_length 32768 \
-    --gradient_checkpointing
-
-# Option 3: Use NSA attention (more memory efficient)
-torchrun --nproc_per_node=2 train.py \
-    --model_size 4B \
-    --optimizer_type adamw \
-    --attention_type native_sparse_attention \
-    --context_length 32768 \
-    --gradient_checkpointing
-
-# Option 4: Reduce context length
-torchrun --nproc_per_node=2 train.py \
-    --model_size 4B \
-    --optimizer_type adamw \
-    --attention_type dense \
-    --context_length 16384 \
-    --gradient_checkpointing
-```
 
 ### Memory Optimization Tips
 

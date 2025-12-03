@@ -1,23 +1,33 @@
 # Dockerfile for NSA + Optimizer Ablation Study
 # Multi-stage build for optimized image size
+# Updated for CUDA 12.9/13.0 compatibility with torch 2.9.1+cu130
 
 # ==============================================================================
 # Stage 1: Build dependencies
 # ==============================================================================
-FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-devel AS builder
+FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04 AS builder
 
-# Install build dependencies
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
+    python3.12 \
+    python3-pip \
+    python3.10-dev \
     git \
     build-essential \
     ninja-build \
+    wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.12 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
 
 WORKDIR /build
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Clone and build native-sparse-attention
 RUN git clone https://github.com/fla-org/native-sparse-attention.git && \
@@ -36,7 +46,7 @@ RUN pip install flash-attn --no-build-isolation || echo "Flash attention not ava
 # ==============================================================================
 # Stage 2: Runtime image
 # ==============================================================================
-FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

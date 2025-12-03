@@ -3,6 +3,7 @@ Optimizer implementations for ablation study
 
 Provides unified interface for:
 - AdamW (baseline)
+- AdamW8bit (8-bit quantized states)
 - SOAP (from NVIDIA Emerging-Optimizers)
 - Shampoo (distributed or single-GPU)
 - SOAP with low-bit optimizer states
@@ -30,7 +31,10 @@ def create_optimizer(
     
     if config.optimizer_type == OptimizerType.ADAMW:
         return create_adamw(param_groups, config)
-    
+
+    elif config.optimizer_type == OptimizerType.ADAMW_8BIT:
+        return create_adamw8bit(param_groups, config)
+
     elif config.optimizer_type == OptimizerType.SOAP:
         return create_soap(param_groups, config)
     
@@ -74,6 +78,33 @@ def create_adamw(param_groups: List[Dict], config: OptimizerConfig) -> Optimizer
         eps=config.eps,
         fused=True,  # Use fused implementation for speed
     )
+
+
+def create_adamw8bit(param_groups: List[Dict], config: OptimizerConfig) -> Optimizer:
+    """
+    Create 8-bit AdamW optimizer from torchao
+    Uses quantized optimizer states to reduce memory usage
+    """
+    try:
+        # Try new import path first (torchao >= 0.15)
+        try:
+            from torchao.optim import AdamW8bit
+        except ImportError:
+            # Fall back to old import path (torchao < 0.15)
+            from torchao.prototype.low_bit_optim import AdamW8bit
+
+        # AdamW8bit expects flat parameter list, not param groups
+        # We need to manually apply weight decay selectively
+        return AdamW8bit(
+            [p for pg in param_groups for p in pg["params"]],
+            lr=config.learning_rate,
+            betas=(config.beta1, config.beta2),
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+        )
+    except (ImportError, AttributeError, ModuleNotFoundError) as e:
+        print(f"Warning: torchao not available or incompatible ({e.__class__.__name__}), falling back to standard AdamW")
+        return create_adamw(param_groups, config)
 
 
 def create_soap(param_groups: List[Dict], config: OptimizerConfig) -> Optimizer:

@@ -14,6 +14,7 @@ class AttentionType(str, Enum):
 
 class OptimizerType(str, Enum):
     ADAMW = "adamw"
+    ADAMW_8BIT = "adamw_8bit"  # 8-bit AdamW from torchao
     SOAP = "soap"
     SHAMPOO = "shampoo"
     SOAP_LOWBIT = "soap_lowbit"  # SOAP with 4-bit/8-bit states

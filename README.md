@@ -2,7 +2,7 @@
 
 This repository contains experiments for efficient training of foundation models. In particular, we experiment with LLM training and the following ablations:
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
-- **Optimizers**: AdamW, SOAP, Shampoo, SOAP with low-bit states
+- **Optimizers**: AdamW, AdamW8bit, SOAP, Shampoo, SOAP with low-bit states
 - **Model sizes**: 0.6B, 4B, 8B, 32B (Qwen-3 architecture)
 - **Context lengths**: 32K, 128K (all), 512K, 1M (NSA only)
 
@@ -29,13 +29,25 @@ chmod +x setup.sh
 source venv/bin/activate
 ```
 
+### GPU Compatibility Note
+
+**Blackwell GPUs** (RTX 50-series, sm_120): Full support is available with PyTorch 2.7.0+cu128
+- The setup script installs PyTorch 2.7.0 with CUDA 12.8 for complete Blackwell support
+- **Full precision support**: float32, float16, and bfloat16 all work correctly
+- Requires NVIDIA driver R570 or higher
+- For optimal performance, consider using [NVIDIA's Optimized Deep Learning Framework containers](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/) (25.01+)
+
+**References**:
+- [PyTorch 2.7 Release Notes](https://pytorch.org/blog/pytorch-2-7/) - Blackwell support added
+- [Software Migration Guide for Blackwell](https://forums.developer.nvidia.com/t/software-migration-guide-for-nvidia-blackwell-rtx-gpus-a-guide-to-cuda-12-8-pytorch-tensorrt-and-llama-cpp/321330)
+
 ## Project Structure
 
 ```
 nsa_optimizer_ablation/
 ├── config.py           # Configuration classes and experiment grid
 ├── model.py            # Model architecture (Dense & NSA attention)
-├── optimizers.py       # Optimizer implementations (AdamW, SOAP, Shampoo)
+├── optimizers.py       # Optimizer implementations (AdamW, AdamW8bit, SOAP, Shampoo)
 ├── data.py             # Data loading and tokenization
 ├── train.py            # Main training script
 ├── run_experiments.py  # Experiment runner and job generation
@@ -52,14 +64,49 @@ The full ablation study covers:
 |-----------|---------|
 | Model Size | 0.6B, 4B, 8B, 32B |
 | Attention | Dense, NSA |
-| Optimizer | AdamW, SOAP, Shampoo, SOAP-LowBit |
+| Optimizer | AdamW, AdamW8bit, SOAP, Shampoo, SOAP-LowBit |
 | Context Length | 32K, 128K, 512K*, 1M* |
 
 *512K and 1M context lengths are only tested with NSA (native sparse attention is designed for long contexts)
 
-**Total experiments**: 128 (4 sizes × 2 attention × 4 optimizers × 4 contexts, with 512K/1M limited to NSA)
+**Total experiments**: 160 (4 sizes × 2 attention × 5 optimizers × 4 contexts, with 512K/1M limited to NSA)
 
 ## Quick Start
+
+### Smoke Tests
+
+Run quick smoke tests to verify your setup:
+
+```bash
+# Run all smoke tests (unit tests + training tests)
+./smoke_test.sh
+
+# Or run specific tests
+source venv/bin/activate
+
+# Just unit tests
+pytest -v
+
+# Just a quick training smoke test
+python train.py \
+    --model_size 0.6B \
+    --attention_type dense \
+    --optimizer_type adamw_8bit \
+    --context_length 32768 \
+    --num_train_steps 2 \
+    --log_interval 1 \
+    --batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --dtype bfloat16
+```
+
+The smoke test script tests:
+- ✓ Unit tests (config, model, optimizers)
+- ✓ AdamW with bfloat16 (baseline)
+- ✓ AdamW8bit with bfloat16
+- ✓ Float16 and Float32 precision modes
+- ✓ Gradient checkpointing
+- ✓ SOAP optimizer (if available)
 
 ### Single Experiment
 
@@ -146,6 +193,8 @@ Models follow the Qwen-3 architecture:
 ### Optimizers
 
 **AdamW**: Standard adaptive optimizer with decoupled weight decay.
+
+**AdamW8bit**: 8-bit quantized AdamW from torchao. Uses block-wise quantization to reduce optimizer state memory by ~75% with minimal accuracy impact.
 
 **SOAP**: ShampoO with Adam in Preconditioner eigenbasis. Combines:
 - Kronecker-factored preconditioning from Shampoo

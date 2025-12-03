@@ -501,13 +501,13 @@ def parse_args():
     parser.add_argument("--attention_type", type=str, default="dense",
                        choices=["dense", "native_sparse_attention"])
     parser.add_argument("--optimizer_type", type=str, default="adamw",
-                       choices=["adamw", "soap", "shampoo", "soap_lowbit"])
+                       choices=["adamw", "adamw_8bit", "soap", "shampoo", "soap_lowbit"])
     parser.add_argument("--context_length", type=int, default=32768,
                        choices=[32768, 131072, 524288, 1048576])
     
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_steps", type=int, default=100000)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--learning_rate", type=float, default=1e-4)

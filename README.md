@@ -29,18 +29,6 @@ chmod +x setup.sh
 source venv/bin/activate
 ```
 
-### GPU Compatibility Note
-
-**Blackwell GPUs** (RTX 50-series, sm_120): Full support is available with PyTorch 2.7.0+cu128
-- The setup script installs PyTorch 2.7.0 with CUDA 12.8 for complete Blackwell support
-- **Full precision support**: float32, float16, and bfloat16 all work correctly
-- Requires NVIDIA driver R570 or higher
-- For optimal performance, consider using [NVIDIA's Optimized Deep Learning Framework containers](https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/) (25.01+)
-
-**References**:
-- [PyTorch 2.7 Release Notes](https://pytorch.org/blog/pytorch-2-7/) - Blackwell support added
-- [Software Migration Guide for Blackwell](https://forums.developer.nvidia.com/t/software-migration-guide-for-nvidia-blackwell-rtx-gpus-a-guide-to-cuda-12-8-pytorch-tensorrt-and-llama-cpp/321330)
-
 ## Project Structure
 
 ```

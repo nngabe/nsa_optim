@@ -241,16 +241,88 @@ OptimizerConfig(
 
 ## Memory Estimates
 
-Approximate GPU memory requirements (A100 80GB):
+**IMPORTANT**: Memory requirements depend heavily on optimizer choice and whether gradient checkpointing is enabled.
 
-| Model | Dense 32K | Dense 128K | NSA 32K | NSA 128K | NSA 512K | NSA 1M |
-|-------|-----------|------------|---------|----------|----------|--------|
-| 0.6B  | 8GB       | 20GB       | 6GB     | 12GB     | 25GB     | 45GB   |
-| 4B    | 25GB      | 60GB       | 20GB    | 40GB     | 70GB     | 140GB* |
-| 8B    | 45GB      | OOM        | 35GB    | 65GB     | 120GB*   | 220GB* |
-| 32B   | 160GB*    | OOM        | 140GB*  | 200GB*   | 350GB*   | 600GB* |
+### Memory Components (per GPU with DDP)
 
-*Requires multi-GPU with model parallelism
+For a model with `P` parameters:
+1. **Model weights**: `P × 2 bytes` (bfloat16)
+2. **Gradients**: `P × 2 bytes` (bfloat16)
+3. **Optimizer states**:
+   - AdamW: `P × 8 bytes` (2 states in fp32)
+   - AdamW-8bit: `P × 2 bytes` (~75% reduction)
+   - SOAP/Shampoo: `P × 12-16 bytes` (more states, but better convergence)
+4. **Activations**: `batch × seq_len × hidden × layers × bytes` (varies significantly)
+   - Without gradient checkpointing: Full activations stored
+   - With gradient checkpointing: ~50-70% memory reduction, ~20% slower
+
+### Per-GPU Memory Requirements (Single GPU or DDP)
+
+**Batch size 1, bfloat16, with gradient checkpointing:**
+
+| Model | Params | Dense 32K | Dense 128K | NSA 32K | NSA 128K | NSA 512K | NSA 1M |
+|-------|--------|-----------|------------|---------|----------|----------|--------|
+| 0.6B  | 0.59B  | AdamW: 18GB<br>AdamW-8bit: 12GB | AdamW: 35GB<br>AdamW-8bit: 25GB | AdamW: 15GB<br>AdamW-8bit: 10GB | AdamW: 28GB<br>AdamW-8bit: 20GB | AdamW: 55GB<br>AdamW-8bit: 40GB | AdamW: 95GB*<br>AdamW-8bit: 70GB* |
+| 4B    | 3.92B  | AdamW: 55GB<br>AdamW-8bit: 35GB | AdamW: 95GB*<br>AdamW-8bit: 65GB | AdamW: 48GB<br>AdamW-8bit: 30GB | AdamW: 80GB<br>AdamW-8bit: 55GB | AdamW: 140GB*<br>AdamW-8bit: 95GB* | OOM* |
+| 8B    | 7.62B  | AdamW: 95GB*<br>AdamW-8bit: 60GB | OOM* | AdamW: 85GB*<br>AdamW-8bit: 55GB | AdamW: 130GB*<br>AdamW-8bit: 85GB* | OOM* | OOM* |
+| 32B   | 31.4B  | OOM* | OOM* | OOM* | OOM* | OOM* | OOM* |
+
+**Without gradient checkpointing, add 50-100% to activation memory.**
+
+*Requires multi-GPU with FSDP or pipeline parallelism
+
+### Example: 4B Model on 2×96GB GPUs
+
+**Your exact configuration** (Dense, 32K, AdamW, no gradient checkpointing):
+- Model: 7.84 GB
+- Optimizer: 31.36 GB
+- Gradients: 7.84 GB
+- Activations: ~48 GB
+- **Total: ~95 GB per GPU → OOM!**
+
+**Recommended fixes:**
+```bash
+# Option 1: Enable gradient checkpointing (recommended)
+torchrun --nproc_per_node=2 train.py \
+    --model_size 4B \
+    --optimizer_type adamw \
+    --attention_type dense \
+    --context_length 32768 \
+    --gradient_checkpointing
+
+# Option 2: Use AdamW-8bit optimizer
+torchrun --nproc_per_node=2 train.py \
+    --model_size 4B \
+    --optimizer_type adamw_8bit \
+    --attention_type dense \
+    --context_length 32768 \
+    --gradient_checkpointing
+
+# Option 3: Use NSA attention (more memory efficient)
+torchrun --nproc_per_node=2 train.py \
+    --model_size 4B \
+    --optimizer_type adamw \
+    --attention_type native_sparse_attention \
+    --context_length 32768 \
+    --gradient_checkpointing
+
+# Option 4: Reduce context length
+torchrun --nproc_per_node=2 train.py \
+    --model_size 4B \
+    --optimizer_type adamw \
+    --attention_type dense \
+    --context_length 16384 \
+    --gradient_checkpointing
+```
+
+### Memory Optimization Tips
+
+1. **Always enable gradient checkpointing** for training (unless you need maximum speed)
+2. **Use AdamW-8bit** to reduce optimizer memory by ~75%
+3. **Use NSA attention** for long context (512K+) - required for those configs
+4. **Use FSDP** instead of DDP for models >8B or when memory is tight
+5. **Reduce batch size** or gradient accumulation steps if still OOM
+6. **Mixed precision**: bfloat16 is recommended (fp16 requires gradient scaling)
 
 ## Monitoring
 

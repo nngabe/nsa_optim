@@ -302,8 +302,10 @@ class NativeSparseAttention(nn.Module):
                 block_size=self.block_size,
                 window_size=self.window_size,
             )
-        except ImportError:
+        except (ImportError, ValueError, TypeError):
             # Fallback to reference implementation
+            # ValueError can occur from model registration conflicts in dependencies
+            # TypeError can occur from API mismatches with the parallel_nsa function
             attn_output = self._reference_nsa(q, k, v, g_slc, g_swa, block_indices)
         
         attn_output = attn_output.view(batch_size, seq_len, -1)

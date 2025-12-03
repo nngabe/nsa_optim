@@ -115,7 +115,8 @@ def setup_model(
     if world_size > 1:
         if world_size <= 8:
             # Use DDP for single-node
-            model = DDP(model, device_ids=[rank])
+            # find_unused_parameters=True handles NSA fallback where k_compress may not receive grads
+            model = DDP(model, device_ids=[rank], find_unused_parameters=True)
         else:
             # Use FSDP for multi-node
             mixed_precision = MixedPrecision(
@@ -498,8 +499,8 @@ def parse_args():
     # Experiment selection
     parser.add_argument("--model_size", type=str, default="0.6B",
                        choices=["0.6B", "4B", "8B", "32B"])
-    parser.add_argument("--attention_type", type=str, default="dense",
-                       choices=["dense", "native_sparse_attention"])
+    parser.add_argument("-attn", "--attention_type", type=str, default="dense",
+                       choices=["dense", "native_sparse_attention", "nsa"])
     parser.add_argument("--optimizer_type", type=str, default="adamw",
                        choices=["adamw", "adamw_8bit", "soap", "shampoo", "soap_lowbit"])
     parser.add_argument("--context_length", type=int, default=32768,
@@ -537,6 +538,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.attention_type=="nsa": args.attention_type="native_sparse_attention"
     
     # Map string args to enums
     model_size = ModelSize(args.model_size)

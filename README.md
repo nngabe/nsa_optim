@@ -12,7 +12,13 @@ We compare efficient architectures, attention mechanisms, and optimizers for tra
 
 - [Native Sparse Attention](https://github.com/fla-org/native-sparse-attention) - Hardware-aligned sparse attention
 - [NVIDIA Emerging-Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers) - SOAP and Shampoo implementations
-- [HuggingFace PEFT](https://github.com/huggingface/peft) - Parameter-efficient fine-tuning utilities
+- [PyTorch AO](https://github.com/pytorch/ao) - PyTorch native quantization and sparsity for training and inference
+
+## Experiment checkpoint
+
+The latest experiment checkpoint can be viewed on Weights & Biases:
+
+[Latest Checkpoint](https://wandb.ai/ngabriel-gwu/nsa-optimizer-ablation/reports/Checkpoint-12-4-2025--VmlldzoxNTI1OTQyOQ)
 
 ## Installation
 
@@ -46,7 +52,7 @@ nsa_optimizer_ablation/
 
 ## Experiment Grid
 
-The full ablation study covers:
+The full ablation study covers a select subset for the following configurations:
 
 | Dimension | Options |
 |-----------|---------|
@@ -57,9 +63,7 @@ The full ablation study covers:
 
 *512K and 1M context lengths are only tested with NSA (native sparse attention is designed for long contexts)
 
-**Total experiments**: 160 (4 sizes × 2 attention × 5 optimizers × 4 contexts, with 512K/1M limited to NSA)
 
-## Quick Start
 
 ### Smoke Tests
 

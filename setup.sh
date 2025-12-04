@@ -21,8 +21,8 @@ pip install --upgrade pip setuptools wheel
 echo "Installing core dependencies..."
 # Install PyTorch 2.9.1 with CUDA 13.0 for Blackwell (sm_120) support
 pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu130
-pip install "transformers>=4.40.0" "datasets>=2.18.0" "tokenizers>=0.15.0" "bitsandbytes>=0.43.0"
-pip install "accelerate>=0.28.0" "wandb>=0.16.0" "einops>=0.7.0" "peft>=0.10.0"
+pip install transformers datasets tokenizers bitsandbytes
+pip install accelerate wandb einops peft
 
 # Install Triton
 echo "Installing Triton..."
@@ -41,6 +41,8 @@ pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/release
 
 # INstall torchao from source (update coming soon but broken now: https://github.com/pytorch/ao/issues/2919)
 echo "Installing torchao from source"
+mkdir -p external
+cd external
 git clone https://github.com/pytorch/ao
 cd ao
 python setup.py install
@@ -49,7 +51,6 @@ cd ..
 # Clone and install Native Sparse Attention
 echo "Installing Native Sparse Attention..."
 if [ ! -d "external/native-sparse-attention" ]; then
-    mkdir -p external
     cd external
     git clone https://github.com/fla-org/native-sparse-attention.git
     cd native-sparse-attention

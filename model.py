@@ -51,7 +51,7 @@ class RotaryEmbedding(nn.Module):
 
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
+        t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
@@ -572,6 +572,59 @@ class TransformerModel(nn.Module):
         """Disable gradient checkpointing for this model"""
         self.gradient_checkpointing = False
 
+    def _compute_loss_chunked(
+        self,
+        hidden_states: Tensor,
+        labels: Tensor,
+        chunk_size: int = 4096,
+    ) -> Tensor:
+        """
+        Compute cross-entropy loss in chunks to avoid OOM with long sequences.
+
+        Instead of materializing full logits tensor (seq_len × vocab_size),
+        we compute logits and loss for each chunk sequentially.
+        """
+        batch_size, seq_len, hidden_size = hidden_states.shape
+
+        # Shift for causal LM: predict next token
+        hidden_states = hidden_states[:, :-1, :]  # Remove last position
+        labels = labels[:, 1:]  # Remove first position
+        seq_len = seq_len - 1
+
+        total_loss = 0.0
+        total_tokens = 0
+
+        # Process in chunks
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_len)
+
+            # Get chunk
+            hidden_chunk = hidden_states[:, chunk_start:chunk_end, :]
+            labels_chunk = labels[:, chunk_start:chunk_end]
+
+            # Compute logits for this chunk only
+            if self.lm_head is not None:
+                logits_chunk = self.lm_head(hidden_chunk)
+            else:
+                logits_chunk = F.linear(hidden_chunk, self.embed_tokens.weight)
+
+            # Compute loss for chunk
+            chunk_loss = F.cross_entropy(
+                logits_chunk.reshape(-1, logits_chunk.size(-1)),
+                labels_chunk.reshape(-1),
+                ignore_index=-100,
+                reduction='sum',
+            )
+
+            # Count non-padding tokens
+            num_tokens = (labels_chunk != -100).sum()
+
+            total_loss += chunk_loss
+            total_tokens += num_tokens
+
+        # Return average loss
+        return total_loss / max(total_tokens, 1)
+
     def _init_weights(self):
         """Initialize weights with small random values"""
         std = 0.02
@@ -636,22 +689,39 @@ class TransformerModel(nn.Module):
                 new_cache.append(cache)
 
         hidden_states = self.norm(hidden_states)
-        
-        if self.lm_head is not None:
-            logits = self.lm_head(hidden_states)
-        else:
-            logits = F.linear(hidden_states, self.embed_tokens.weight)
-        
+
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-        
+            # Use chunked loss for long sequences to avoid OOM
+            # Threshold: if logits would be > 10GB, use chunking
+            vocab_size = self.config.vocab_size
+            logits_size_gb = (batch_size * seq_len * vocab_size * 2) / (1024**3)  # bfloat16 = 2 bytes
+
+            if logits_size_gb > 10.0:
+                # Compute loss in chunks without materializing full logits
+                loss = self._compute_loss_chunked(hidden_states, labels, chunk_size=4096)
+                logits = None  # Don't materialize logits to save memory
+            else:
+                # Standard loss computation for shorter sequences
+                if self.lm_head is not None:
+                    logits = self.lm_head(hidden_states)
+                else:
+                    logits = F.linear(hidden_states, self.embed_tokens.weight)
+
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+        else:
+            # No labels, compute logits normally
+            if self.lm_head is not None:
+                logits = self.lm_head(hidden_states)
+            else:
+                logits = F.linear(hidden_states, self.embed_tokens.weight)
+
         return logits, loss, new_cache if use_cache else None
 
 

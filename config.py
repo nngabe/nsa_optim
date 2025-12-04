@@ -10,6 +10,7 @@ from enum import Enum
 class AttentionType(str, Enum):
     DENSE = "dense"
     NSA = "native_sparse_attention"
+    FSA = "flash_sparse_attention"
 
 
 class OptimizerType(str, Enum):

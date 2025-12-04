@@ -93,6 +93,14 @@ def create_adamw8bit(param_groups: List[Dict], config: OptimizerConfig) -> Optim
             # Fall back to old import path (torchao < 0.15)
             from torchao.prototype.low_bit_optim import AdamW8bit
 
+        # Test if AdamW8bit is actually usable by creating a test instance
+        test_param = torch.nn.Parameter(torch.randn(1))
+        try:
+            test_opt = AdamW8bit([test_param], lr=1e-3)
+            del test_opt, test_param
+        except Exception as e:
+            raise RuntimeError(f"AdamW8bit initialization failed: {e}")
+
         # AdamW8bit expects flat parameter list, not param groups
         # We need to manually apply weight decay selectively
         return AdamW8bit(
@@ -102,8 +110,9 @@ def create_adamw8bit(param_groups: List[Dict], config: OptimizerConfig) -> Optim
             eps=config.eps,
             weight_decay=config.weight_decay,
         )
-    except (ImportError, AttributeError, ModuleNotFoundError) as e:
-        print(f"Warning: torchao not available or incompatible ({e.__class__.__name__}), falling back to standard AdamW")
+    except (ImportError, AttributeError, ModuleNotFoundError, RuntimeError) as e:
+        print(f"Warning: torchao AdamW8bit not available or incompatible ({e.__class__.__name__}: {e})")
+        print("Falling back to standard AdamW")
         return create_adamw(param_groups, config)
 
 

@@ -16,6 +16,7 @@ import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any
 from contextlib import nullcontext
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -105,6 +106,7 @@ def setup_model(
     
     # Setup dtype
     dtype = getattr(torch, training_config.dtype)
+    print(f'model dtype: {dtype}')
     model = model.to(dtype)
     
     # Gradient checkpointing
@@ -113,31 +115,31 @@ def setup_model(
     
     # Distributed setup
     if world_size > 1:
-        if world_size <= 8:
+        #if world_size <= 1:
             # Use DDP for single-node
             # find_unused_parameters=True handles NSA fallback where k_compress may not receive grads
-            model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        else:
-            # Use FSDP for multi-node
-            mixed_precision = MixedPrecision(
-                param_dtype=dtype,
-                reduce_dtype=torch.float32,
-                buffer_dtype=dtype,
-            )
-            
-            auto_wrap_policy = transformer_auto_wrap_policy(
-                transformer_layer_cls={TransformerBlock},
-            )
-            
-            model = FSDP(
-                model,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                mixed_precision=mixed_precision,
-                auto_wrap_policy=auto_wrap_policy,
-                backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-                device_id=rank,
-            )
-    
+            #model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        #else:
+        mixed_precision = MixedPrecision(
+            param_dtype=dtype,
+            reduce_dtype=torch.float32,
+            buffer_dtype=dtype,
+        )
+        
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={TransformerBlock},
+        )
+        
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            mixed_precision=mixed_precision,
+            auto_wrap_policy=auto_wrap_policy,
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            device_id=rank,
+        )
+
     return model
 
 
@@ -500,7 +502,7 @@ def parse_args():
     parser.add_argument("--model_size", type=str, default="0.6B",
                        choices=["0.6B", "4B", "8B", "32B"])
     parser.add_argument("-attn", "--attention_type", type=str, default="dense",
-                       choices=["dense", "native_sparse_attention", "nsa"])
+                       choices=["dense", "native_sparse_attention", "nsa", "flash_sparse_attention", "fsa"])
     parser.add_argument("--optimizer_type", type=str, default="adamw",
                        choices=["adamw", "adamw_8bit", "soap", "shampoo", "soap_lowbit"])
     parser.add_argument("--context_length", type=int, default=32768,
@@ -539,6 +541,7 @@ def parse_args():
 def main():
     args = parse_args()
     if args.attention_type=="nsa": args.attention_type="native_sparse_attention"
+    if args.attention_type=="fsa": args.attention_type="flash_sparse_attention"
     
     # Map string args to enums
     model_size = ModelSize(args.model_size)

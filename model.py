@@ -15,6 +15,12 @@ from torch import Tensor
 
 from config import ModelConfig, AttentionType
 
+try:
+    from fsa.module.fsa import FlashSparseAttention as FSAModule, RopeConfig
+    FSA_AVAILABLE = True
+except ImportError:
+    FSA_AVAILABLE = False
+
 
 class RMSNorm(nn.Module):
     """RMS Normalization as used in Qwen/LLaMA"""
@@ -350,6 +356,131 @@ class NativeSparseAttention(nn.Module):
         return output
 
 
+class FlashSparseAttention(nn.Module):
+    """
+    Flash Sparse Attention from https://github.com/Relaxed-System-Lab/Flash-Sparse-Attention
+    Optimized kernel implementation for NSA selected attention module with improved efficiency
+    """
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+
+        # Block and sparsity parameters
+        self.block_size = config.nsa_block_size
+        self.topk = config.nsa_num_selected_blocks
+
+        # Projections
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        # Initialize FSA module if available
+        if FSA_AVAILABLE:
+            rope_config = RopeConfig(
+                max_position_embeddings=config.max_position_embeddings,
+                head_dim=self.head_dim,
+                rope_theta=config.rope_theta,
+            )
+
+            self.fsa_module = FSAModule(
+                hidden_size=self.hidden_size,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                block_size=self.block_size,
+                topk=self.topk,
+                rope_config=rope_config,
+            )
+        else:
+            self.fsa_module = None
+            # Fallback to regular rotary embeddings
+            self.rotary_emb = RotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                base=config.rope_theta,
+            )
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
+        past_key_value: Optional[Tuple[Tensor, Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[Tensor, Optional[Tuple[Tensor, Tensor]]]:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        if self.fsa_module is not None and not use_cache:
+            # Use optimized FSA kernel
+            # Compute cu_seqlens for variable-length batch support
+            # For now, assume uniform sequence lengths in the batch
+            seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=hidden_states.device)
+            cu_seqlens = torch.cat([
+                torch.zeros(1, dtype=torch.int32, device=hidden_states.device),
+                torch.cumsum(seqlens, dim=0)
+            ], dim=0)
+
+            # Flatten batch dimension for FSA
+            x_flat = hidden_states.view(-1, self.hidden_size)
+
+            # FSA forward pass
+            attn_output = self.fsa_module(x_flat, cu_seqlens)
+
+            # Reshape back to batch format
+            attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
+
+            return attn_output, None
+        else:
+            # Fallback to standard attention (when FSA is unavailable or when using cache)
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
+
+            q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+            # Apply rotary embeddings
+            cos, sin = self.rotary_emb(hidden_states, position_ids)
+            q, k = apply_rotary_pos_emb(q.transpose(1, 2), k.transpose(1, 2), cos, sin)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+
+            # Handle KV cache
+            if past_key_value is not None:
+                k = torch.cat([past_key_value[0], k], dim=2)
+                v = torch.cat([past_key_value[1], v], dim=2)
+
+            new_cache = (k, v) if use_cache else None
+
+            # Expand KV for GQA
+            if self.num_kv_groups > 1:
+                k = k.repeat_interleave(self.num_kv_groups, dim=1)
+                v = v.repeat_interleave(self.num_kv_groups, dim=1)
+
+            # Use scaled dot product attention
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attention_mask,
+                is_causal=attention_mask is None,
+                dropout_p=0.0,
+            )
+
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.view(batch_size, seq_len, -1)
+            attn_output = self.o_proj(attn_output)
+
+            return attn_output, new_cache
+
+
 class MLP(nn.Module):
     """MLP with SwiGLU activation as used in Qwen"""
     def __init__(self, config: ModelConfig):
@@ -375,6 +506,8 @@ class TransformerBlock(nn.Module):
         # Select attention type
         if config.attention_type == AttentionType.NSA:
             self.self_attn = NativeSparseAttention(config, layer_idx)
+        elif config.attention_type == AttentionType.FSA:
+            self.self_attn = FlashSparseAttention(config, layer_idx)
         else:
             self.self_attn = DenseAttention(config, layer_idx)
         

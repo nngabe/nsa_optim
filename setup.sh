@@ -20,7 +20,7 @@ pip install --upgrade pip setuptools wheel
 # Install core dependencies
 echo "Installing core dependencies..."
 # Install PyTorch 2.9.1 with CUDA 13.0 for Blackwell (sm_120) support
-pip install torch==2.9.1 torchvision torchao --index-url https://download.pytorch.org/whl/cu130
+pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu130
 pip install "transformers>=4.40.0" "datasets>=2.18.0" "tokenizers>=0.15.0" "bitsandbytes>=0.43.0"
 pip install "accelerate>=0.28.0" "wandb>=0.16.0" "einops>=0.7.0" "peft>=0.10.0"
 
@@ -34,7 +34,17 @@ pip install ninja
 
 # Try to install Flash Attention
 echo "Installing Flash Attention..."
-pip install flash-attn --no-build-isolation 2>/dev/null || echo "Warning: Flash Attention installation failed, will use PyTorch SDPA"
+pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.5.4/flash_attn-2.8.3+cu130torch2.9-cp312-cp312-linux_x86_64.whl"
+#export TORCH_CUDA_ARCH_LIST="12.0"
+#pip install -v flash-attn --no-build-isolation 2>/dev/null || echo "Warning: Flash Attention installation failed, will use PyTorch SDPA"
+#
+
+# INstall torchao from source (update coming soon but broken now: https://github.com/pytorch/ao/issues/2919)
+echo "Installing torchao from source"
+git clone https://github.com/pytorch/ao
+cd ao
+python setup.py install
+cd ..
 
 # Clone and install Native Sparse Attention
 echo "Installing Native Sparse Attention..."
@@ -49,6 +59,22 @@ if [ ! -d "external/native-sparse-attention" ]; then
 else
     echo "Native Sparse Attention already cloned"
 fi
+
+# Clone and install Flash Sparse Attention
+echo "Installing Flash Sparse Attention..."
+if [ ! -d "external/Flash-Sparse-Attention" ]; then
+    cd external
+    git clone https://github.com/Relaxed-System-Lab/Flash-Sparse-Attention.git
+    cd ../
+fi
+
+# Install FSA dependencies (skip flash-attn since we already installed it)
+echo "Installing Flash Sparse Attention dependencies..."
+pip install nvidia_cudnn_frontend
+
+# Add Flash-Sparse-Attention to Python path
+export PYTHONPATH="${PYTHONPATH}:$(pwd)/external/Flash-Sparse-Attention"
+echo "export PYTHONPATH=\"\${PYTHONPATH}:$(pwd)/external/Flash-Sparse-Attention\"" >> venv/bin/activate
 
 # Clone and install NVIDIA Emerging-Optimizers
 echo "Installing NVIDIA Emerging-Optimizers..."

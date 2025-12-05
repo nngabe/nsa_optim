@@ -1,6 +1,6 @@
 # Native Sparse Attention + SOAP optimizer Ablation Study
 
-This repository contains experiments for efficient training of foundation models. In particular, we investigate LLM training with the following ablation studies.:
+This repository contains experiments for efficient training of foundation models. In particular, we investigate LLM training with the following ablations:
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
 - **Optimizers**: AdamW, AdamW8bit, SOAP4bit
 - **Model sizes**: 0.6B, 4B, 8B **

@@ -20,7 +20,7 @@ We compare efficient architectures, attention mechanisms, and optimizers for tra
 
 The latest experiment checkpoint can be viewed on Weights & Biases:
 
-[Latest Checkpoint](https://wandb.ai/ngabriel-gwu/nsa-optimizer-ablation/reports/Checkpoint-12-4-2025--VmlldzoxNTI1OTQyOQ)
+[Latest Checkpoint](https://api.wandb.ai/links/ngabriel-gwu/u1p3w3xx)
 
 ## Installation
 

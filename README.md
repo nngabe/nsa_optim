@@ -3,8 +3,10 @@
 This repository contains experiments for efficient training of foundation models. In particular, we investigate LLM training with the following ablation studies.:
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
 - **Optimizers**: AdamW, AdamW8bit, SOAP4bit
-- **Model sizes**: 0.6B, 4B, 8B (Qwen-3 style architecture: RMSNorm, SwiGLU, RoPE, and GQA)
-- **Context lengths**: 32K, 65k, 131k
+- **Model sizes**: 0.6B, 4B, 8B **
+- **Context lengths**: 32K, 64k, 128k
+
+  **(Qwen-3 style architecture: RMSNorm, SwiGLU, RoPE, and GQA)
 
 ## Overview
 
@@ -60,7 +62,6 @@ The full ablation study covers a select subset for the following configurations:
 | Attention | Dense, NSA |
 | Optimizer | AdamW, AdamW8bit, SOAP4bit |
 | Context Length | 32K, 64K, 128K |
-
 
 
 ### Smoke Tests

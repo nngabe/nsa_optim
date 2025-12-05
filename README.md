@@ -152,13 +152,6 @@ python run_experiments.py \
     --attention_types dense native_sparse_attention \
     --optimizer_types adamw soap \
     --num_gpus=8
-
-# Generate SLURM scripts for cluster
-python run_experiments.py \
-    --mode=slurm \
-    --partition=gpu \
-    --account=myaccount \
-    --time_limit=48:00:00
 ```
 
 ## Model Architecture
@@ -195,80 +188,8 @@ Models follow the Qwen-3 architecture:
 
 **Shampoo**: Full matrix preconditioning with Kronecker factorization.
 
-**SOAP-LowBit**: SOAP with 4-bit quantized optimizer states for memory efficiency.
+**SOAP4bit**: SOAP with 4-bit quantized optimizer states for memory efficiency.
 
-## Configuration
-
-### Training Config
-
-```python
-TrainingConfig(
-    model_size=ModelSize.SMALL,       # 0.6B, 4B, 8B, 32B
-    attention_type=AttentionType.NSA, # dense, native_sparse_attention
-    optimizer_type=OptimizerType.SOAP,
-    max_seq_length=131072,            # Context length
-    batch_size=1,
-    gradient_accumulation_steps=16,
-    num_train_steps=100000,
-    warmup_steps=2000,
-    dtype="bfloat16",
-    gradient_checkpointing=True,
-)
-```
-
-### Optimizer Config
-
-```python
-OptimizerConfig(
-    optimizer_type=OptimizerType.SOAP,
-    learning_rate=1e-4,
-    weight_decay=0.1,
-    beta1=0.9,
-    beta2=0.95,
-    precondition_frequency=10,  # SOAP/Shampoo specific
-    shampoo_beta=0.95,          # Kronecker factor EMA
-    max_precond_dim=8192,       # Max dimension for preconditioning
-)
-```
-
-## Memory Estimates
-
-### Memory Components (per GPU with DDP)
-
-For a model with `P` parameters:
-1. **Model weights**: `P × 2 bytes` (bfloat16)
-2. **Gradients**: `P × 2 bytes` (bfloat16)
-3. **Optimizer states**:
-   - AdamW: `P × 8 bytes` (2 states in fp32)
-   - AdamW-8bit: `P × 2 bytes` (~75% reduction)
-   - SOAP/Shampoo: `P × 12-16 bytes` (more states, but better convergence)
-4. **Activations**: `batch × seq_len × hidden × layers × bytes` (varies significantly)
-   - Without gradient checkpointing: Full activations stored
-   - With gradient checkpointing: ~50-70% memory reduction, ~20% slower
-
-### Per-GPU Memory Requirements (Single GPU or DDP)
-
-**Batch size 1, bfloat16, with gradient checkpointing:**
-
-| Model | Params | Dense 32K | Dense 128K | NSA 32K | NSA 128K | NSA 512K | NSA 1M |
-|-------|--------|-----------|------------|---------|----------|----------|--------|
-| 0.6B  | 0.59B  | 12GB | 25GB | 10GB | 20GB | 40GB | 70GB |
-| 4B    | 3.92B  | 35GB | 65GB | 30GB | 55GB | 95GB | OOM* |
-| 8B    | 7.62B  | 60GB | OOM* | 55GB | 85GB | OOM* | OOM* |
-| 32B   | 31.4B  | OOM* | OOM* | OOM* | OOM* | OOM* | OOM* |
-
-**Without gradient checkpointing, add 50-100% to activation memory.**
-
-*Requires multi-GPU with FSDP or pipeline parallelism
-
-### Memory Optimization Tips
-
-1. **Always enable gradient checkpointing** for training (unless you need maximum speed)
-2. **Use AdamW-8bit** to reduce optimizer memory by ~75%
-3. **Use NSA attention** for long context (512K+) - required for those configs
-4. **Use FSDP** instead of DDP for models >8B or when memory is tight
-5. **Reduce batch size** or gradient accumulation steps if still OOM
-6. **Mixed precision**: bfloat16 is recommended (fp16 requires gradient scaling)
 
 ## Monitoring
 
@@ -304,15 +225,6 @@ python train.py \
     --resume_from ./outputs/my_run/checkpoint-50000 \
     ...
 ```
-
-## Results
-
-Based on the literature, expected findings include:
-
-1. **NSA vs Dense**: NSA should show similar quality with 2-4x memory efficiency at long contexts
-2. **SOAP vs AdamW**: SOAP typically converges 1.5-2x faster in wall-clock time
-3. **Shampoo vs SOAP**: Similar convergence, SOAP slightly more stable
-4. **Low-bit SOAP**: ~2x memory reduction with minimal quality loss
 
 ## Citation
 

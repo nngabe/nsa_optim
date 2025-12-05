@@ -2,9 +2,9 @@
 
 This repository contains experiments for efficient training of foundation models. In particular, we investigate LLM training with the following ablation studies.:
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
-- **Optimizers**: AdamW, AdamW8bit, SOAP, Shampoo, SOAP with low-bit states
+- **Optimizers**: AdamW, AdamW8bit, SOAP4bit
 - **Model sizes**: 0.6B, 4B, 8B, 32B (Qwen-3 architecture)
-- **Context lengths**: 32K, 128K (all), 512K, 1M (NSA only)
+- **Context lengths**: 32K, 65k, 131k
 
 ## Overview
 
@@ -58,10 +58,8 @@ The full ablation study covers a select subset for the following configurations:
 |-----------|---------|
 | Model Size | 0.6B, 4B, 8B, 32B |
 | Attention | Dense, NSA |
-| Optimizer | AdamW, AdamW8bit, SOAP, Shampoo, SOAP-LowBit |
-| Context Length | 32K, 128K, 512K*, 1M* |
-
-*512K and 1M context lengths are only tested with NSA (native sparse attention is designed for long contexts)
+| Optimizer | AdamW, AdamW8bit, SOAP4bit |
+| Context Length | 32K, 64K, 128K |
 
 
 

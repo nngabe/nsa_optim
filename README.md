@@ -6,7 +6,7 @@ This repository contains experiments for efficient training of foundation models
 - **Model sizes**: 0.6B, 4B, 8B **
 - **Context lengths**: 32K, 64k, 128k
 
-  **(Qwen-3 style architecture: RMSNorm, SwiGLU, RoPE, and GQA)
+  ** Qwen-3 style architecture: RMSNorm, SwiGLU, RoPE, and GQA
 
 ## Overview
 

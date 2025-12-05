@@ -1,4 +1,4 @@
-# NSA + Optimizer Ablation Study
+# Native Sparse Attention + SOAP optimizer Ablation Study
 
 This repository contains experiments for efficient training of foundation models. In particular, we investigate LLM training with the following ablation studies.:
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)

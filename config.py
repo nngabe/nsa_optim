@@ -15,10 +15,12 @@ class AttentionType(str, Enum):
 
 class OptimizerType(str, Enum):
     ADAMW = "adamw"
-    ADAMW_8BIT = "adamw_8bit"  # 8-bit AdamW from torchao
+    ADAMW_4BIT = "adamw4bit"  # 4-bit AdamW from lpmm
+    ADAMW_8BIT = "adamw8bit"   # 8-bit AdamW from torchao/lpmm
     SOAP = "soap"
+    SOAP_4BIT = "soap4bit"     # SOAP with 4-bit states
+    SOAP_8BIT = "soap8bit"     # SOAP with 8-bit states
     SHAMPOO = "shampoo"
-    SOAP_LOWBIT = "soap_lowbit"  # SOAP with 4-bit/8-bit states
 
 
 class ModelSize(str, Enum):
@@ -101,11 +103,16 @@ class OptimizerConfig:
     # SOAP/Shampoo specific
     precondition_frequency: int = 10
     shampoo_beta: float = 0.95
-    max_precond_dim: int = 8192
-    
+    max_precond_dim: int = 1024  # Reduced from 8192 to save memory (8x less memory per factor)
+
     # Low-bit optimizer specific (for SOAP_LOWBIT)
     use_4bit: bool = True
     use_8bit: bool = False
+
+    # Shampoo optimizer state precision (for distributed_shampoo)
+    # Options: "float32", "bfloat16", "float16"
+    # Using bfloat16 can reduce memory by 2x with minimal accuracy loss
+    shampoo_state_dtype: str = "bfloat16"
 
 
 @dataclass

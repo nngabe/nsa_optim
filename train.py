@@ -44,6 +44,12 @@ from config import (
 from model import TransformerModel, TransformerBlock, create_model
 from optimizers import create_optimizer, get_lr_scheduler
 from data import DataConfig, create_dataloader, get_tokenizer
+from profile import (
+    calculate_flops_per_token,
+    calculate_arithmetic_intensity,
+    format_flops,
+    format_arithmetic_intensity,
+)
 
 
 def setup_distributed():
@@ -115,11 +121,6 @@ def setup_model(
     
     # Distributed setup
     if world_size > 1:
-        #if world_size <= 1:
-            # Use DDP for single-node
-            # find_unused_parameters=True handles NSA fallback where k_compress may not receive grads
-            #model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-        #else:
         mixed_precision = MixedPrecision(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
@@ -356,9 +357,12 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
     model = setup_model(config, rank, world_size)
     
     # Count parameters
+    num_params = sum(p.numel() for p in model.parameters())
     if is_main:
-        num_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {num_params / 1e9:.2f}B")
+
+    # Get model config for FLOPS calculation
+    model_config = get_model_config(config)
     
     # Setup optimizer
     optimizer_config = config.optimizer_config or OptimizerConfig(
@@ -446,29 +450,49 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
                 elapsed = time.time() - start_time
                 avg_loss = running_loss / config.log_interval
                 tokens_per_sec = (
-                    config.batch_size * config.max_seq_length * 
+                    config.batch_size * config.max_seq_length *
                     config.log_interval * world_size
                 ) / elapsed
-                
+
+                # Calculate FLOPS and Arithmetic Intensity
+                dtype_bytes = 2 if config.dtype in ["bfloat16", "float16"] else 4
+                flops_per_token = calculate_flops_per_token(
+                    model_config,
+                    config.max_seq_length
+                )
+                total_flops_per_sec = flops_per_token * tokens_per_sec
+
+                arithmetic_intensity = calculate_arithmetic_intensity(
+                    model_config,
+                    batch_size=config.batch_size * world_size,
+                    seq_len=config.max_seq_length,
+                    num_params=num_params,
+                    dtype_bytes=dtype_bytes,
+                )
+
                 log_str = (
                     f"Step {step}/{config.num_train_steps} | "
                     f"Loss: {avg_loss:.4f} | "
                     f"LR: {metrics.get('lr', 0):.2e} | "
-                    f"Tokens/s: {tokens_per_sec:.0f}"
+                    f"Tok/s: {tokens_per_sec:.0f} | "
+                    f"{format_flops(total_flops_per_sec)}/s | "
+                    f"AI: {format_arithmetic_intensity(arithmetic_intensity)}"
                 )
                 if "grad_norm" in metrics:
-                    log_str += f" | Grad norm: {metrics['grad_norm']:.2f}"
-                
+                    log_str += f" | Grad: {metrics['grad_norm']:.2f}"
+
                 print(log_str)
-                
+
                 if use_wandb:
                     wandb.log({
                         "train/loss": avg_loss,
                         "train/lr": metrics.get("lr", 0),
                         "train/tokens_per_sec": tokens_per_sec,
                         "train/grad_norm": metrics.get("grad_norm", 0),
+                        "train/tflops_per_sec": total_flops_per_sec / 1e12,
+                        "train/arithmetic_intensity": arithmetic_intensity,
                     }, step=step)
-                
+
                 running_loss = 0.0
                 start_time = time.time()
             
@@ -504,18 +528,18 @@ def parse_args():
     parser.add_argument("-attn", "--attention_type", type=str, default="dense",
                        choices=["dense", "native_sparse_attention", "nsa", "flash_sparse_attention", "fsa"])
     parser.add_argument("--optimizer_type", type=str, default="adamw",
-                       choices=["adamw", "adamw_8bit", "soap", "shampoo", "soap_lowbit"])
+                       choices=["adamw", "adamw4bit", "adamw8bit", "soap", "soap4bit", "soap8bit", "shampoo"])
     parser.add_argument("--context_length", type=int, default=32768,
-                       choices=[32768, 131072, 524288, 1048576])
+                       choices=[32768, 65536, 131072, 524288, 1048576])
     
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_steps", type=int, default=100000)
     parser.add_argument("--warmup_steps", type=int, default=2000)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("-lr","--learning_rate", type=float, default=1e-4)
+    parser.add_argument("-wd","--weight_decay", type=float, default=0.1)
+    parser.add_argument("-clip","--max_grad_norm", type=float, default=1.0)
     
     # Precision
     parser.add_argument("--dtype", type=str, default="bfloat16",

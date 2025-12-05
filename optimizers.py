@@ -25,25 +25,31 @@ def create_optimizer(
     tensor_parallel_size: int = 1,
 ) -> Optimizer:
     """Factory function to create optimizer from config"""
-    
+
     # Separate parameters by weight decay eligibility
     param_groups = get_param_groups(model, config.weight_decay)
-    
+
     if config.optimizer_type == OptimizerType.ADAMW:
         return create_adamw(param_groups, config)
 
+    elif config.optimizer_type == OptimizerType.ADAMW_4BIT:
+        return create_adamw_lowbit(param_groups, config, bits=4)
+
     elif config.optimizer_type == OptimizerType.ADAMW_8BIT:
-        return create_adamw8bit(param_groups, config)
+        return create_adamw_lowbit(param_groups, config, bits=8)
 
     elif config.optimizer_type == OptimizerType.SOAP:
         return create_soap(param_groups, config)
-    
+
+    elif config.optimizer_type == OptimizerType.SOAP_4BIT:
+        return create_soap_lowbit(param_groups, config, bits=4)
+
+    elif config.optimizer_type == OptimizerType.SOAP_8BIT:
+        return create_soap_lowbit(param_groups, config, bits=8)
+
     elif config.optimizer_type == OptimizerType.SHAMPOO:
         return create_shampoo(param_groups, config, tensor_parallel_size)
-    
-    elif config.optimizer_type == OptimizerType.SOAP_LOWBIT:
-        return create_soap_lowbit(param_groups, config)
-    
+
     else:
         raise ValueError(f"Unknown optimizer type: {config.optimizer_type}")
 
@@ -80,40 +86,59 @@ def create_adamw(param_groups: List[Dict], config: OptimizerConfig) -> Optimizer
     )
 
 
-def create_adamw8bit(param_groups: List[Dict], config: OptimizerConfig) -> Optimizer:
+def create_adamw_lowbit(param_groups: List[Dict], config: OptimizerConfig, bits: int = 8) -> Optimizer:
     """
-    Create 8-bit AdamW optimizer from torchao
-    Uses quantized optimizer states to reduce memory usage
+    Create low-bit AdamW optimizer (4-bit or 8-bit)
+    Uses lpmm for 4-bit or torchao for 8-bit quantized optimizer states
+
+    Args:
+        param_groups: Parameter groups with weight decay settings
+        config: Optimizer configuration
+        bits: Quantization bits (4 or 8)
     """
+    # Try lpmm first (supports both 4-bit and 8-bit)
     try:
-        # Try new import path first (torchao >= 0.15)
-        try:
-            from torchao.optim import AdamW8bit
-        except ImportError:
-            # Fall back to old import path (torchao < 0.15)
-            from torchao.prototype.low_bit_optim import AdamW8bit
-
-        # Test if AdamW8bit is actually usable by creating a test instance
-        test_param = torch.nn.Parameter(torch.randn(1))
-        try:
-            test_opt = AdamW8bit([test_param], lr=1e-3)
-            del test_opt, test_param
-        except Exception as e:
-            raise RuntimeError(f"AdamW8bit initialization failed: {e}")
-
-        # AdamW8bit expects flat parameter list, not param groups
-        # We need to manually apply weight decay selectively
-        return AdamW8bit(
+        import lpmm
+        print(f"Using lpmm {bits}-bit AdamW")
+        return lpmm.optim.AdamW(
             [p for pg in param_groups for p in pg["params"]],
             lr=config.learning_rate,
             betas=(config.beta1, config.beta2),
             eps=config.eps,
             weight_decay=config.weight_decay,
         )
-    except (ImportError, AttributeError, ModuleNotFoundError, RuntimeError) as e:
-        print(f"Warning: torchao AdamW8bit not available or incompatible ({e.__class__.__name__}: {e})")
-        print("Falling back to standard AdamW")
-        return create_adamw(param_groups, config)
+    except ImportError:
+        if bits == 4:
+            print("Warning: lpmm not available, cannot use 4-bit AdamW")
+            print("Falling back to standard AdamW")
+            return create_adamw(param_groups, config)
+
+    # Fallback to torchao for 8-bit
+    if bits == 8:
+        try:
+            # Try new import path first (torchao >= 0.15)
+            try:
+                from torchao.optim import AdamW8bit
+            except ImportError:
+                # Fall back to old import path (torchao < 0.15)
+                from torchao.prototype.low_bit_optim import AdamW8bit
+
+            print("Using torchao 8-bit AdamW")
+            return AdamW8bit(
+                [p for pg in param_groups for p in pg["params"]],
+                lr=config.learning_rate,
+                betas=(config.beta1, config.beta2),
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+            )
+        except (ImportError, AttributeError, ModuleNotFoundError, RuntimeError) as e:
+            print(f"Warning: torchao AdamW8bit not available ({e.__class__.__name__}: {e})")
+            print("Falling back to standard AdamW")
+            return create_adamw(param_groups, config)
+
+    # Unknown bits value
+    print(f"Warning: Unsupported bits={bits}, falling back to standard AdamW")
+    return create_adamw(param_groups, config)
 
 
 def create_soap(param_groups: List[Dict], config: OptimizerConfig) -> Optimizer:
@@ -132,10 +157,6 @@ def create_soap(param_groups: List[Dict], config: OptimizerConfig) -> Optimizer:
             eps=config.eps,
             weight_decay=config.weight_decay,
             precondition_frequency=config.precondition_frequency,
-            max_precond_dim=config.max_precond_dim,
-            use_decoupled_weight_decay=True,
-            precondition_1d=False,
-            correct_bias=True,
         )
     except ImportError:
         print("Warning: NVIDIA Emerging-Optimizers not installed, using reference SOAP")
@@ -158,8 +179,25 @@ def create_shampoo(param_groups: List[Dict], config: OptimizerConfig, tensor_par
     try:
         if tensor_parallel_size > 1:
             from distributed_shampoo.distributed_shampoo import DistributedShampoo
-            from distributed_shampoo.shampoo_types import AdamGraftingConfig
-            
+            from distributed_shampoo.shampoo_types import (
+                AdamPreconditionerConfig,
+                RootInvShampooPreconditionerConfig,
+            )
+
+            # Convert dtype string to torch dtype
+            dtype_map = {
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+            }
+            state_dtype = dtype_map.get(config.shampoo_state_dtype, torch.float32)
+
+            # Create preconditioner config with specified dtype
+            preconditioner_config = RootInvShampooPreconditionerConfig(
+                factor_matrix_dtype=state_dtype,
+                inv_factor_matrix_dtype=state_dtype,
+            )
+
             return DistributedShampoo(
                 [p for pg in param_groups for p in pg["params"]],
                 lr=config.learning_rate,
@@ -170,10 +208,11 @@ def create_shampoo(param_groups: List[Dict], config: OptimizerConfig, tensor_par
                 max_preconditioner_dim=config.max_precond_dim,
                 precondition_frequency=config.precondition_frequency,
                 use_decoupled_weight_decay=True,
-                grafting_config=AdamGraftingConfig(
+                grafting_config=AdamPreconditionerConfig(
                     beta2=config.beta2,
                     epsilon=config.eps,
                 ),
+                preconditioner_config=preconditioner_config,
             )
         else:
             # Single-GPU Shampoo
@@ -197,50 +236,34 @@ def create_shampoo(param_groups: List[Dict], config: OptimizerConfig, tensor_par
         )
 
 
-def create_soap_lowbit(param_groups: List[Dict], config: OptimizerConfig) -> Optimizer:
+def create_soap_lowbit(param_groups: List[Dict], config: OptimizerConfig, bits: int = 4) -> Optimizer:
     """
     Create SOAP with low-bit (4-bit or 8-bit) optimizer states
-    Uses lpmm or torchao for quantized states
+    Uses custom SOAPLowBit implementation with quantized preconditioners
+
+    Args:
+        param_groups: Parameter groups with weight decay settings
+        config: Optimizer configuration
+        bits: Quantization bits (4 or 8)
     """
+    # Try using SOAPLowBit implementation (supports quantization)
     try:
-        # Try using lpmm for 4-bit states
-        if config.use_4bit:
-            import lpmm
-            
-            # Wrap SOAP optimizer with low-bit states
-            return SOAPLowBit(
-                param_groups,
-                lr=config.learning_rate,
-                betas=(config.beta1, config.beta2),
-                shampoo_beta=config.shampoo_beta,
-                eps=config.eps,
-                precondition_frequency=config.precondition_frequency,
-                max_precond_dim=config.max_precond_dim,
-                bits=4,
-            )
-    except ImportError:
-        pass
-    
-    try:
-        # Fallback to torchao 8-bit
-        if config.use_8bit:
-            from torchao.prototype.low_bit_optim import AdamW8bit
-            
-            # For 8-bit, we use Adam as base since SOAP 8-bit isn't directly available
-            print("Warning: Using 8-bit AdamW as fallback (SOAP low-bit not available)")
-            return AdamW8bit(
-                [p for pg in param_groups for p in pg["params"]],
-                lr=config.learning_rate,
-                betas=(config.beta1, config.beta2),
-                eps=config.eps,
-                weight_decay=config.weight_decay,
-            )
-    except ImportError:
-        pass
-    
-    # Final fallback
-    print("Warning: Low-bit optimizers not available, using standard SOAP")
-    return create_soap(param_groups, config)
+        print(f"Using SOAP with {bits}-bit quantized states")
+        return SOAPLowBit(
+            param_groups,
+            lr=config.learning_rate,
+            betas=(config.beta1, config.beta2),
+            shampoo_beta=config.shampoo_beta,
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+            precondition_frequency=config.precondition_frequency,
+            max_precond_dim=config.max_precond_dim,
+            bits=bits,
+        )
+    except Exception as e:
+        print(f"Warning: SOAPLowBit not available ({e.__class__.__name__}: {e})")
+        print("Falling back to standard SOAP")
+        return create_soap(param_groups, config)
 
 
 class SOAPReference(Optimizer):

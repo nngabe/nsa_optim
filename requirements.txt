@@ -13,6 +13,7 @@ peft==0.18.0
 # Optimizers
 torchao==0.14.1
 bitsandbytes==0.48.2
+fairscale==0.4.13
 
 # NVIDIA Emerging-Optimizers (install from source)
 # git clone https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git

@@ -22,7 +22,7 @@ echo "Installing core dependencies..."
 # Install PyTorch 2.9.1 with CUDA 13.0 for Blackwell (sm_120) support
 pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu130
 pip install transformers datasets tokenizers bitsandbytes
-pip install accelerate wandb einops peft
+pip install accelerate wandb einops peft fairscale
 
 # Install Triton
 echo "Installing Triton..."
@@ -41,12 +41,16 @@ pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/release
 
 # INstall torchao from source (update coming soon but broken now: https://github.com/pytorch/ao/issues/2919)
 echo "Installing torchao from source"
-mkdir -p external
-cd external
-git clone https://github.com/pytorch/ao
-cd ao
-python setup.py install
-cd ..
+if [ ! -d "external/ao" ]; then
+    mkdir -p external
+    cd external
+    git clone https://github.com/pytorch/ao
+    cd ao
+    python setup.py install
+    cd ../..
+else 
+    echo "torchao already built"
+fi
 
 # Clone and install Native Sparse Attention
 echo "Installing Native Sparse Attention..."

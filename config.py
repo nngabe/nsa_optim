@@ -13,6 +13,13 @@ class AttentionType(str, Enum):
     FSA = "flash_sparse_attention"
 
 
+class MambaType(str, Enum):
+    """Mamba architecture types for hybrid models"""
+    NONE = "none"           # Pure transformer (no Mamba)
+    MAMBA2 = "mamba2"       # Mamba-2 (SSD formulation)
+    MAMBA3 = "mamba3"       # Mamba-3 (trapezoidal discretization)
+
+
 class OptimizerType(str, Enum):
     ADAMW = "adamw"
     ADAMW_4BIT = "adamw4bit"  # 4-bit AdamW from lpmm
@@ -121,7 +128,11 @@ class TrainingConfig:
     # Model
     model_size: ModelSize = ModelSize.SMALL
     attention_type: AttentionType = AttentionType.DENSE
-    
+
+    # Mamba/Jamba configuration
+    mamba_type: MambaType = MambaType.NONE  # None = pure transformer, mamba2/mamba3 = pure mamba or Jamba hybrid
+    jamba_ratio: int = 7  # Ratio of mamba:attention blocks (7:1 by default, only used when both mamba_type and attn_type are set)
+
     # Optimizer
     optimizer_type: OptimizerType = OptimizerType.ADAMW
     optimizer_config: Optional[OptimizerConfig] = None
@@ -164,9 +175,19 @@ class TrainingConfig:
     def __post_init__(self):
         if self.optimizer_config is None:
             self.optimizer_config = OptimizerConfig(optimizer_type=self.optimizer_type)
-        
+
         if not self.run_name:
-            self.run_name = f"{self.model_size.value}_{self.attention_type.value}_{self.optimizer_type.value}_ctx{self.max_seq_length}"
+            # Build architecture name based on mamba_type and attention_type
+            if self.mamba_type != MambaType.NONE and self.attention_type != AttentionType.DENSE:
+                # Jamba hybrid
+                arch_name = f"jamba_{self.mamba_type.value}_{self.attention_type.value}"
+            elif self.mamba_type != MambaType.NONE:
+                # Pure Mamba
+                arch_name = self.mamba_type.value
+            else:
+                # Pure Transformer
+                arch_name = self.attention_type.value
+            self.run_name = f"{self.model_size.value}_{arch_name}_{self.optimizer_type.value}_ctx{self.max_seq_length}"
 
 
 # Context length configurations

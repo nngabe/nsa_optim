@@ -30,8 +30,8 @@ git clone https://github.com/nngabe/nsa_optim.git
 cd nsa_optim
 
 # Run setup script
-chmod +x setup.sh
-./setup.sh
+chmod +x scripts/setup.sh
+./scripts/setup.sh
 
 # Activate environment
 source venv/bin/activate
@@ -41,15 +41,21 @@ source venv/bin/activate
 
 ```
 nsa_optimizer_ablation/
-├── config.py           # Configuration classes and experiment grid
-├── model.py            # Model architecture (Dense & NSA attention)
-├── optimizers.py       # Optimizer implementations (AdamW, AdamW8bit, SOAP, Shampoo)
-├── data.py             # Data loading and tokenization
-├── train.py            # Main training script
-├── run_experiments.py  # Experiment runner and job generation
-├── setup.sh            # Installation script
-├── requirements.txt    # Python dependencies
-└── README.md           # This file
+├── config.py              # Configuration classes and experiment grid
+├── model.py               # Model architecture (Dense & NSA attention)
+├── optimizers.py          # Optimizer implementations (AdamW, AdamW8bit, SOAP, Shampoo)
+├── data.py                # Data loading and tokenization
+├── train.py               # Main training script
+├── run_experiments.py     # Experiment runner and job generation
+├── requirements.txt       # Python dependencies
+├── README.md              # This file
+├── mamba/                 # Mamba architecture implementations
+├── profiling/             # Memory profiling utilities
+├── tests/                 # Unit tests
+├── scripts/               # Shell scripts (setup.sh, smoke_test.sh)
+├── docker/                # Dockerfile for containerization
+├── configs/               # Configuration files (lpmm_config.txt)
+└── analysis/              # Analysis and evaluation utilities
 ```
 
 ## Experiment Grid
@@ -70,7 +76,7 @@ Run quick smoke tests to verify your setup:
 
 ```bash
 # Run all smoke tests (unit tests + training tests)
-./smoke_test.sh
+./scripts/smoke_test.sh
 
 # Or run specific tests
 source venv/bin/activate

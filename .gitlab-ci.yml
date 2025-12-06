@@ -170,7 +170,7 @@ build:docker:
     DOCKER_TLS_CERTDIR: "/certs"
   script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA -f Dockerfile .
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA -f docker/Dockerfile .
     - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
     - |
       if [ "$CI_COMMIT_BRANCH" == "main" ]; then
@@ -385,7 +385,7 @@ analyze:results:
     - train:smoke-nsa-soap
   script:
     - pip install numpy matplotlib
-    - python analysis.py
+    - python analysis/analysis.py
         --output_dir outputs/
         --report_path analysis_report.json
         --plot
@@ -406,7 +406,7 @@ analyze:compare-attention:
   script:
     - pip install numpy pandas
     - python -c "
-      from analysis import load_experiment_results, compare_attention_types
+      from analysis.analysis import load_experiment_results, compare_attention_types
       import json
       
       results = load_experiment_results('outputs/')
@@ -436,7 +436,7 @@ analyze:compare-optimizers:
   script:
     - pip install numpy pandas
     - python -c "
-      from analysis import load_experiment_results, compare_optimizers
+      from analysis.analysis import load_experiment_results, compare_optimizers
       import json
       
       results = load_experiment_results('outputs/')

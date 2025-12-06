@@ -14,7 +14,7 @@ import time
 import json
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from contextlib import nullcontext
 from functools import partial
 
@@ -32,10 +32,11 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from config import (
-    TrainingConfig, 
-    ModelConfig, 
-    MODEL_CONFIGS, 
+    TrainingConfig,
+    ModelConfig,
+    MODEL_CONFIGS,
     AttentionType,
+    MambaType,
     OptimizerType,
     ModelSize,
     OptimizerConfig,
@@ -45,7 +46,9 @@ from config import (
 from model import TransformerModel, TransformerBlock, create_model
 from optimizers import create_optimizer, get_lr_scheduler
 from data import DataConfig, create_dataloader, get_tokenizer
-from mamba3.mamba3_triton import Mamba3Model, Mamba3Config, Mamba3Block, create_mamba3
+from mamba.mamba3_triton import Mamba3Model, Mamba3Config, Mamba3Block, create_mamba3
+from mamba.mamba2 import Mamba2Model, Mamba2Config, Mamba2Block, create_mamba2
+from mamba.jamba import JambaModel, JambaConfig, JambaMambaBlock, JambaAttentionBlock, create_jamba
 from profiling import (
     calculate_flops_per_token,
     calculate_arithmetic_intensity,
@@ -107,6 +110,14 @@ MAMBA3_CONFIGS = {
     ModelSize.XLARGE: Mamba3Config(d_model=6144, n_layers=48, d_state=128, head_dim=64, vocab_size=151936),
 }
 
+# Mamba2 config mappings based on model size
+MAMBA2_CONFIGS = {
+    ModelSize.SMALL: Mamba2Config(d_model=1024, n_layers=24, d_state=128, headdim=64, vocab_size=151936),
+    ModelSize.MEDIUM: Mamba2Config(d_model=2560, n_layers=32, d_state=128, headdim=64, vocab_size=151936),
+    ModelSize.LARGE: Mamba2Config(d_model=3584, n_layers=36, d_state=128, headdim=64, vocab_size=151936),
+    ModelSize.XLARGE: Mamba2Config(d_model=6144, n_layers=48, d_state=128, headdim=64, vocab_size=151936),
+}
+
 
 def get_mamba3_config(training_config: TrainingConfig) -> Mamba3Config:
     """Get Mamba3 configuration based on training config"""
@@ -124,18 +135,103 @@ def get_mamba3_config(training_config: TrainingConfig) -> Mamba3Config:
     )
 
 
+def get_mamba2_config(training_config: TrainingConfig) -> Mamba2Config:
+    """Get Mamba2 configuration based on training config"""
+    base_config = MAMBA2_CONFIGS[training_config.model_size]
+
+    return Mamba2Config(
+        d_model=base_config.d_model,
+        n_layers=base_config.n_layers,
+        d_state=base_config.d_state,
+        headdim=base_config.headdim,
+        vocab_size=base_config.vocab_size,
+        expand=base_config.expand,
+        use_triton=True,
+        gradient_checkpointing=training_config.gradient_checkpointing,
+    )
+
+
+def get_jamba_config(training_config: TrainingConfig) -> JambaConfig:
+    """Get Jamba configuration based on training config"""
+    model_config = get_model_config(training_config)
+
+    # Map attention type to string
+    if training_config.attention_type == AttentionType.NSA:
+        attn_type = "nsa"
+    elif training_config.attention_type == AttentionType.FSA:
+        attn_type = "fsa"
+    else:
+        attn_type = "dense"
+
+    # Map mamba type to string
+    mamba_type = training_config.mamba_type.value
+
+    return JambaConfig(
+        d_model=model_config.hidden_size,
+        n_layers=model_config.num_hidden_layers,
+        vocab_size=model_config.vocab_size,
+        num_attention_heads=model_config.num_attention_heads,
+        num_key_value_heads=model_config.num_key_value_heads,
+        attn_type=attn_type,
+        nsa_block_size=model_config.nsa_block_size,
+        nsa_window_size=model_config.nsa_window_size,
+        nsa_num_selected_blocks=model_config.nsa_num_selected_blocks,
+        mamba_type=mamba_type,
+        d_state=128,
+        jamba_ratio=training_config.jamba_ratio,
+        intermediate_size=model_config.intermediate_size,
+        max_position_embeddings=model_config.max_position_embeddings,
+        rope_theta=model_config.rope_theta,
+        rms_norm_eps=model_config.rms_norm_eps,
+        gradient_checkpointing=training_config.gradient_checkpointing,
+    )
+
+
+def get_model_type(training_config: TrainingConfig) -> str:
+    """Determine the model type based on mamba_type and attention_type."""
+    has_mamba = training_config.mamba_type != MambaType.NONE
+    has_sparse_attn = training_config.attention_type in (AttentionType.NSA, AttentionType.FSA)
+
+    if has_mamba and has_sparse_attn:
+        # Jamba hybrid with sparse attention
+        return "jamba"
+    elif has_mamba and training_config.attention_type == AttentionType.DENSE:
+        # Could be pure mamba or jamba with dense attention
+        # Pure mamba if we want no attention blocks at all
+        # For now, treat mamba + dense as jamba (with dense attention blocks)
+        # To get pure mamba, user should use --jamba_ratio with a very high value
+        return training_config.mamba_type.value  # "mamba2" or "mamba3"
+    else:
+        # Pure transformer
+        return "transformer"
+
+
 def setup_model(
     training_config: TrainingConfig,
     rank: int,
     world_size: int,
-    model_type: str = "transformer",
-) -> nn.Module:
-    """Setup model with optional distributed wrapping"""
-    if model_type == "mamba3":
+) -> Tuple[nn.Module, str]:
+    """Setup model with optional distributed wrapping.
+
+    Returns:
+        model: The initialized model
+        model_type: String indicating the model type for logging
+    """
+    model_type = get_model_type(training_config)
+
+    if model_type == "jamba":
+        jamba_config = get_jamba_config(training_config)
+        model = JambaModel(jamba_config)
+        block_cls = {JambaMambaBlock, JambaAttentionBlock}
+    elif model_type == "mamba3":
         mamba3_config = get_mamba3_config(training_config)
         model = Mamba3Model(mamba3_config)
         block_cls = {Mamba3Block}
-    else:
+    elif model_type == "mamba2":
+        mamba2_config = get_mamba2_config(training_config)
+        model = Mamba2Model(mamba2_config)
+        block_cls = {Mamba2Block}
+    else:  # transformer
         model_config = get_model_config(training_config)
         model = create_model(model_config)
         block_cls = {TransformerBlock}
@@ -149,8 +245,8 @@ def setup_model(
     print(f'model dtype: {dtype}')
     model = model.to(dtype)
 
-    # Gradient checkpointing (transformer only, mamba3 handles it via config)
-    if training_config.gradient_checkpointing and model_type == "transformer":
+    # Gradient checkpointing (transformer and jamba handle it via method, mamba via config)
+    if training_config.gradient_checkpointing and model_type in ("transformer", "jamba"):
         model.gradient_checkpointing_enable()
 
     # Distributed setup
@@ -175,7 +271,7 @@ def setup_model(
             device_id=rank,
         )
 
-    return model
+    return model, model_type
 
 
 def train_step(
@@ -391,11 +487,14 @@ def load_checkpoint(
     return config["step"]
 
 
-def train(config: TrainingConfig, resume_from: Optional[str] = None, model_type: str = "transformer"):
+def train(config: TrainingConfig, resume_from: Optional[str] = None):
     """Main training function"""
     # Setup distributed
     rank, world_size, local_rank = setup_distributed()
     is_main = rank == 0
+
+    # Determine model type from config
+    model_type = get_model_type(config)
 
     # Logging
     if is_main:
@@ -413,17 +512,20 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None, model_type:
     else:
         use_wandb = False
 
-    # Load tokenizer - Qwen tokenizer works for both (vocab_size=151936)
+    # Load tokenizer - Qwen tokenizer works for all model types (vocab_size=151936)
     tokenizer = get_tokenizer("Qwen/Qwen3-0.6B")
 
     # Setup model
     if is_main:
-        if model_type == "mamba3":
-            print(f"Setting up Mamba3 model: {config.model_size.value}")
+        if model_type == "jamba":
+            print(f"Setting up Jamba model: {config.model_size.value} "
+                  f"(mamba={config.mamba_type.value}, attn={config.attention_type.value}, ratio={config.jamba_ratio}:1)")
+        elif model_type in ("mamba2", "mamba3"):
+            print(f"Setting up {model_type.upper()} model: {config.model_size.value}")
         else:
             print(f"Setting up Transformer model: {config.model_size.value} with {config.attention_type.value}")
 
-    model = setup_model(config, rank, world_size, model_type=model_type)
+    model, model_type = setup_model(config, rank, world_size)
     
     # Count parameters
     num_params = sum(p.numel() for p in model.parameters())
@@ -600,16 +702,21 @@ def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Train models for ablation study")
 
-    # Model type selection
-    parser.add_argument("--model_type", type=str, default="transformer",
-                       choices=["transformer", "mamba3"],
-                       help="Model architecture type: transformer or mamba3")
+    # Architecture selection (mamba_type and attn_type together determine the architecture)
+    parser.add_argument("--mamba_type", type=str, default="none",
+                       choices=["none", "mamba2", "mamba3"],
+                       help="Mamba architecture type: none (pure transformer), mamba2, or mamba3. "
+                            "When combined with a non-dense attn_type, creates a Jamba hybrid.")
+    parser.add_argument("-attn", "--attn_type", type=str, default="dense",
+                       choices=["dense", "native_sparse_attention", "nsa", "flash_sparse_attention", "fsa"],
+                       help="Attention type: dense, nsa (native sparse), or fsa (flash sparse). "
+                            "When combined with mamba_type, creates a Jamba hybrid.")
+    parser.add_argument("--jamba_ratio", type=int, default=7,
+                       help="Ratio of mamba blocks to attention blocks in Jamba (default: 7:1)")
 
     # Experiment selection
     parser.add_argument("--model_size", type=str, default="0.6B",
                        choices=["0.6B", "4B", "8B", "32B"])
-    parser.add_argument("-attn", "--attention_type", type=str, default="dense",
-                       choices=["dense", "native_sparse_attention", "nsa", "flash_sparse_attention", "fsa"])
     parser.add_argument("--optimizer_type", type=str, default="adamw",
                        choices=["adamw", "adamw4bit", "adamw8bit", "soap", "soap4bit", "soap8bit", "shampoo"])
     parser.add_argument("--context_length", type=int, default=8192,
@@ -647,25 +754,32 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.attention_type=="nsa": args.attention_type="native_sparse_attention"
-    if args.attention_type=="fsa": args.attention_type="flash_sparse_attention"
-    
+
+    # Normalize attention type aliases
+    if args.attn_type == "nsa":
+        args.attn_type = "native_sparse_attention"
+    if args.attn_type == "fsa":
+        args.attn_type = "flash_sparse_attention"
+
     # Map string args to enums
     model_size = ModelSize(args.model_size)
-    attention_type = AttentionType(args.attention_type)
+    attention_type = AttentionType(args.attn_type)
+    mamba_type = MambaType(args.mamba_type)
     optimizer_type = OptimizerType(args.optimizer_type)
-    
+
     # Create optimizer config
     optimizer_config = OptimizerConfig(
         optimizer_type=optimizer_type,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    
+
     # Create training config
     config = TrainingConfig(
         model_size=model_size,
         attention_type=attention_type,
+        mamba_type=mamba_type,
+        jamba_ratio=args.jamba_ratio,
         optimizer_type=optimizer_type,
         optimizer_config=optimizer_config,
         max_seq_length=args.context_length,
@@ -684,22 +798,26 @@ def main():
         save_interval=args.save_interval,
     )
 
-    # Update run_name with simplified attention/model type names
+    # Update run_name if not provided (config.__post_init__ handles this, but we can override)
     if not args.run_name:
-        if args.model_type == "mamba3":
-            arch_name = "mamba3"
-        elif attention_type == AttentionType.NATIVE_SPARSE_ATTENTION:
+        # Determine architecture name
+        if mamba_type != MambaType.NONE and attention_type != AttentionType.DENSE:
+            # Jamba hybrid with sparse attention
+            attn_short = "nsa" if attention_type == AttentionType.NSA else "fsa"
+            arch_name = f"jamba_{mamba_type.value}_{attn_short}"
+        elif mamba_type != MambaType.NONE:
+            # Pure Mamba
+            arch_name = mamba_type.value
+        elif attention_type == AttentionType.NSA:
             arch_name = "nsa"
-        elif attention_type == AttentionType.DENSE:
-            arch_name = "dense"
-        elif attention_type == AttentionType.FLASH_SPARSE_ATTENTION:
+        elif attention_type == AttentionType.FSA:
             arch_name = "fsa"
         else:
-            arch_name = attention_type.value
+            arch_name = "dense"
 
         config.run_name = f"{model_size.value}_{arch_name}_{optimizer_type.value}_ctx{args.context_length}"
 
-    train(config, args.resume_from, model_type=args.model_type)
+    train(config, args.resume_from)
 
 
 if __name__ == "__main__":

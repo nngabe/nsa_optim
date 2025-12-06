@@ -22,7 +22,7 @@ echo "Installing core dependencies..."
 # Install PyTorch 2.9.1 with CUDA 13.0 for Blackwell (sm_120) support
 pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu130
 pip install transformers datasets tokenizers bitsandbytes
-pip install accelerate wandb einops peft fairscale
+pip install accelerate wandb einops peft fairscale yacs
 
 # Install Triton
 echo "Installing Triton..."

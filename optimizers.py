@@ -552,31 +552,17 @@ class SOAPLowBit(Optimizer):
         self._step = 0
         self.bits = bits
         
-        # Try to import lpmm for quantization
-        try:
-            import lpmm
-            self.use_lpmm = True
-        except ImportError:
-            self.use_lpmm = False
-            print("Warning: lpmm not available, using simulated quantization")
-
     def _quantize(self, tensor: Tensor) -> Tuple[Tensor, float, float]:
-        """Quantize tensor to low-bit representation"""
-        if self.use_lpmm:
-            # Use lpmm's quantization
-            import lpmm
-            return lpmm.quantize(tensor, bits=self.bits)
-        else:
-            # Simple min-max quantization
-            min_val = tensor.min()
-            max_val = tensor.max()
-            scale = (max_val - min_val) / (2**self.bits - 1)
-            
-            if scale == 0:
-                scale = 1.0
-            
-            quantized = ((tensor - min_val) / scale).round().to(torch.uint8)
-            return quantized, scale.item(), min_val.item()
+        """Quantize tensor to low-bit representation using min-max quantization"""
+        min_val = tensor.min()
+        max_val = tensor.max()
+        scale = (max_val - min_val) / (2**self.bits - 1)
+
+        if scale == 0:
+            scale = torch.tensor(1.0, device=tensor.device)
+
+        quantized = ((tensor - min_val) / scale).round().to(torch.uint8)
+        return quantized, scale.item(), min_val.item()
 
     def _dequantize(self, quantized: Tensor, scale: float, min_val: float) -> Tensor:
         """Dequantize tensor back to float"""

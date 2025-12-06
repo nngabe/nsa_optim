@@ -20,6 +20,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import (
@@ -44,7 +45,8 @@ from config import (
 from model import TransformerModel, TransformerBlock, create_model
 from optimizers import create_optimizer, get_lr_scheduler
 from data import DataConfig, create_dataloader, get_tokenizer
-from profile import (
+from mamba3.mamba3_triton import Mamba3Model, Mamba3Config, Mamba3Block, create_mamba3
+from profiling import (
     calculate_flops_per_token,
     calculate_arithmetic_intensity,
     format_flops,
@@ -79,7 +81,7 @@ def cleanup_distributed():
 def get_model_config(training_config: TrainingConfig) -> ModelConfig:
     """Get model configuration based on training config"""
     base_config = MODEL_CONFIGS[training_config.model_size]
-    
+
     # Create a copy with updated attention type and context length
     return ModelConfig(
         name=base_config.name,
@@ -97,28 +99,60 @@ def get_model_config(training_config: TrainingConfig) -> ModelConfig:
     )
 
 
+# Mamba3 config mappings based on model size
+MAMBA3_CONFIGS = {
+    ModelSize.SMALL: Mamba3Config(d_model=1024, n_layers=24, d_state=128, head_dim=64, vocab_size=151936),
+    ModelSize.MEDIUM: Mamba3Config(d_model=2560, n_layers=32, d_state=128, head_dim=64, vocab_size=151936),
+    ModelSize.LARGE: Mamba3Config(d_model=3584, n_layers=36, d_state=128, head_dim=64, vocab_size=151936),
+    ModelSize.XLARGE: Mamba3Config(d_model=6144, n_layers=48, d_state=128, head_dim=64, vocab_size=151936),
+}
+
+
+def get_mamba3_config(training_config: TrainingConfig) -> Mamba3Config:
+    """Get Mamba3 configuration based on training config"""
+    base_config = MAMBA3_CONFIGS[training_config.model_size]
+
+    return Mamba3Config(
+        d_model=base_config.d_model,
+        n_layers=base_config.n_layers,
+        d_state=base_config.d_state,
+        head_dim=base_config.head_dim,
+        vocab_size=base_config.vocab_size,
+        expand=base_config.expand,
+        use_triton=True,
+        gradient_checkpointing=training_config.gradient_checkpointing,
+    )
+
+
 def setup_model(
     training_config: TrainingConfig,
     rank: int,
     world_size: int,
+    model_type: str = "transformer",
 ) -> nn.Module:
     """Setup model with optional distributed wrapping"""
-    model_config = get_model_config(training_config)
-    model = create_model(model_config)
-    
+    if model_type == "mamba3":
+        mamba3_config = get_mamba3_config(training_config)
+        model = Mamba3Model(mamba3_config)
+        block_cls = {Mamba3Block}
+    else:
+        model_config = get_model_config(training_config)
+        model = create_model(model_config)
+        block_cls = {TransformerBlock}
+
     # Move to device
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    
+
     # Setup dtype
     dtype = getattr(torch, training_config.dtype)
     print(f'model dtype: {dtype}')
     model = model.to(dtype)
-    
-    # Gradient checkpointing
-    if training_config.gradient_checkpointing:
+
+    # Gradient checkpointing (transformer only, mamba3 handles it via config)
+    if training_config.gradient_checkpointing and model_type == "transformer":
         model.gradient_checkpointing_enable()
-    
+
     # Distributed setup
     if world_size > 1:
         mixed_precision = MixedPrecision(
@@ -126,12 +160,12 @@ def setup_model(
             reduce_dtype=torch.float32,
             buffer_dtype=dtype,
         )
-        
+
         auto_wrap_policy = partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={TransformerBlock},
+            transformer_layer_cls=block_cls,
         )
-        
+
         model = FSDP(
             model,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -153,45 +187,60 @@ def train_step(
     config: TrainingConfig,
     step: int,
     grad_accum_step: int,
+    model_type: str = "transformer",
 ) -> Dict[str, float]:
     """Execute single training step"""
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
-    
+
     # Move batch to device
     input_ids = batch["input_ids"].to(device)
     labels = batch["labels"].to(device)
     attention_mask = batch.get("attention_mask")
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
-    
+
     # Forward pass with autocast
     use_amp = scaler is not None
     autocast_ctx = torch.cuda.amp.autocast(dtype=dtype) if use_amp else nullcontext()
-    
+
     with autocast_ctx:
-        _, loss, _ = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-        )
-        
+        if model_type == "mamba3":
+            # Mamba3 returns (logits, cache)
+            logits, _ = model(input_ids)
+            # Compute cross-entropy loss manually
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        else:
+            # Transformer returns (logits, loss, hidden_states)
+            _, loss, _ = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+
         # Scale loss for gradient accumulation
         loss = loss / config.gradient_accumulation_steps
-    
+
     # Backward pass
     if use_amp:
         scaler.scale(loss).backward()
     else:
         loss.backward()
-    
+
     metrics = {"loss": loss.item() * config.gradient_accumulation_steps}
-    
+
     # Optimizer step after accumulation
     if (grad_accum_step + 1) % config.gradient_accumulation_steps == 0:
         if use_amp:
             scaler.unscale_(optimizer)
-        
+
         # Gradient clipping
         if config.max_grad_norm > 0:
             if isinstance(model, (DDP, FSDP)):
@@ -203,18 +252,18 @@ def train_step(
                     model.parameters(), config.max_grad_norm
                 )
             metrics["grad_norm"] = grad_norm.item()
-        
+
         if use_amp:
             scaler.step(optimizer)
             scaler.update()
         else:
             optimizer.step()
-        
+
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
-        
+
         metrics["lr"] = scheduler.get_last_lr()[0]
-    
+
     return metrics
 
 
@@ -223,43 +272,58 @@ def evaluate(
     eval_dataloader,
     config: TrainingConfig,
     max_batches: int = 50,
+    model_type: str = "transformer",
 ) -> Dict[str, float]:
     """Run evaluation"""
     model.eval()
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
-    
+
     total_loss = 0.0
     total_tokens = 0
-    
+
     with torch.no_grad():
         for i, batch in enumerate(eval_dataloader):
             if i >= max_batches:
                 break
-            
+
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
-            
+
             with torch.cuda.amp.autocast(dtype=dtype):
-                _, loss, _ = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )
-            
+                if model_type == "mamba3":
+                    # Mamba3 returns (logits, cache)
+                    logits, _ = model(input_ids)
+                    # Compute cross-entropy loss manually
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                        reduction='mean',
+                    )
+                else:
+                    # Transformer returns (logits, loss, hidden_states)
+                    _, loss, _ = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+
             # Count non-padding tokens
             num_tokens = (labels != -100).sum().item()
             total_loss += loss.item() * num_tokens
             total_tokens += num_tokens
-    
+
     model.train()
-    
+
     avg_loss = total_loss / max(1, total_tokens)
     perplexity = math.exp(avg_loss)
-    
+
     return {"eval_loss": avg_loss, "eval_perplexity": perplexity}
 
 
@@ -271,34 +335,36 @@ def save_checkpoint(
     config: TrainingConfig,
     output_dir: str,
     rank: int,
+    model_type: str = "transformer",
 ):
     """Save training checkpoint"""
     if rank != 0:
         return
-    
+
     checkpoint_dir = Path(output_dir) / f"checkpoint-{step}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Get model state dict (handle DDP/FSDP)
     if isinstance(model, (DDP, FSDP)):
         model_state = model.module.state_dict()
     else:
         model_state = model.state_dict()
-    
+
     torch.save(model_state, checkpoint_dir / "model.pt")
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
-    
+
     # Save config
     with open(checkpoint_dir / "config.json", "w") as f:
         json.dump({
             "step": step,
+            "model_type": model_type,
             "model_size": config.model_size.value,
             "attention_type": config.attention_type.value,
             "optimizer_type": config.optimizer_type.value,
             "max_seq_length": config.max_seq_length,
         }, f, indent=2)
-    
+
     print(f"Saved checkpoint to {checkpoint_dir}")
 
 
@@ -325,12 +391,12 @@ def load_checkpoint(
     return config["step"]
 
 
-def train(config: TrainingConfig, resume_from: Optional[str] = None):
+def train(config: TrainingConfig, resume_from: Optional[str] = None, model_type: str = "transformer"):
     """Main training function"""
     # Setup distributed
     rank, world_size, local_rank = setup_distributed()
     is_main = rank == 0
-    
+
     # Logging
     if is_main:
         try:
@@ -338,7 +404,7 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
             wandb.init(
                 project="nsa-optimizer-ablation",
                 name=config.run_name,
-                config=vars(config),
+                config={**vars(config), "model_type": model_type},
             )
             use_wandb = True
         except ImportError:
@@ -346,15 +412,18 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
             print("wandb not available, skipping logging")
     else:
         use_wandb = False
-    
-    # Load tokenizer
+
+    # Load tokenizer - Qwen tokenizer works for both (vocab_size=151936)
     tokenizer = get_tokenizer("Qwen/Qwen3-0.6B")
 
     # Setup model
     if is_main:
-        print(f"Setting up model: {config.model_size.value} with {config.attention_type.value}")
-    
-    model = setup_model(config, rank, world_size)
+        if model_type == "mamba3":
+            print(f"Setting up Mamba3 model: {config.model_size.value}")
+        else:
+            print(f"Setting up Transformer model: {config.model_size.value} with {config.attention_type.value}")
+
+    model = setup_model(config, rank, world_size, model_type=model_type)
     
     # Count parameters
     num_params = sum(p.numel() for p in model.parameters())
@@ -362,7 +431,11 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
         print(f"Model parameters: {num_params / 1e9:.2f}B")
 
     # Get model config for FLOPS calculation
-    model_config = get_model_config(config)
+    if model_type == "mamba3":
+        # For mamba3, we still use transformer config for rough FLOPS estimation
+        model_config = get_model_config(config)
+    else:
+        model_config = get_model_config(config)
     
     # Setup optimizer
     optimizer_config = config.optimizer_config or OptimizerConfig(
@@ -423,6 +496,8 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
     grad_accum_step = 0
     running_loss = 0.0
     start_time = time.time()
+    tokens_per_step = config.batch_size * config.max_seq_length * world_size * config.gradient_accumulation_steps
+    total_tokens = start_step * tokens_per_step
 
     while step < config.num_train_steps:
         # Get next batch
@@ -435,7 +510,7 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
         # Training step
         metrics = train_step(
             model, batch, optimizer, scheduler, scaler,
-            config, step, grad_accum_step,
+            config, step, grad_accum_step, model_type=model_type,
         )
         
         running_loss += metrics["loss"]
@@ -444,7 +519,8 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
         # Update step counter after full gradient accumulation
         if grad_accum_step % config.gradient_accumulation_steps == 0:
             step += 1
-            
+            total_tokens += tokens_per_step
+
             # Logging
             if step % config.log_interval == 0 and is_main:
                 elapsed = time.time() - start_time
@@ -472,10 +548,11 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
 
                 log_str = (
                     f"Step {step}/{config.num_train_steps} | "
+                    f"Tokens: {total_tokens / 1e9:.3f}B | "
                     f"Loss: {avg_loss:.4f} | "
                     f"LR: {metrics.get('lr', 0):.2e} | "
                     f"Tok/s: {tokens_per_sec:.0f} | "
-                    f"{format_flops(total_flops_per_sec)}/s | "
+                    f"{format_flops(total_flops_per_sec)} | "
                     f"AI: {format_arithmetic_intensity(arithmetic_intensity)}"
                 )
                 if "grad_norm" in metrics:
@@ -487,9 +564,10 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
                     wandb.log({
                         "train/loss": avg_loss,
                         "train/lr": metrics.get("lr", 0),
+                        "train/tokens": total_tokens,
                         "train/tokens_per_sec": tokens_per_sec,
                         "train/grad_norm": metrics.get("grad_norm", 0),
-                        "train/tflops_per_sec": total_flops_per_sec / 1e12,
+                        "train/tflops": total_flops_per_sec / 1e12,
                         "train/arithmetic_intensity": arithmetic_intensity,
                     }, step=step)
 
@@ -500,13 +578,13 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
             if step % config.save_interval == 0:
                 save_checkpoint(
                     model, optimizer, scheduler, step,
-                    config, str(output_dir), rank,
+                    config, str(output_dir), rank, model_type=model_type,
                 )
-    
+
     # Final save
     save_checkpoint(
         model, optimizer, scheduler, step,
-        config, str(output_dir), rank,
+        config, str(output_dir), rank, model_type=model_type,
     )
     
     if use_wandb and is_main:
@@ -521,7 +599,12 @@ def train(config: TrainingConfig, resume_from: Optional[str] = None):
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Train models for ablation study")
-    
+
+    # Model type selection
+    parser.add_argument("--model_type", type=str, default="transformer",
+                       choices=["transformer", "mamba3"],
+                       help="Model architecture type: transformer or mamba3")
+
     # Experiment selection
     parser.add_argument("--model_size", type=str, default="0.6B",
                        choices=["0.6B", "4B", "8B", "32B"])
@@ -529,13 +612,13 @@ def parse_args():
                        choices=["dense", "native_sparse_attention", "nsa", "flash_sparse_attention", "fsa"])
     parser.add_argument("--optimizer_type", type=str, default="adamw",
                        choices=["adamw", "adamw4bit", "adamw8bit", "soap", "soap4bit", "soap8bit", "shampoo"])
-    parser.add_argument("--context_length", type=int, default=32768,
-                       choices=[32768, 65536, 131072, 524288, 1048576])
+    parser.add_argument("--context_length", type=int, default=8192,
+                       choices=[8192, 32768, 65536, 131072, 524288, 1048576])
     
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--num_train_steps", type=int, default=100000)
+    parser.add_argument("--num_train_steps", type=int, default=10000)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("-lr","--learning_rate", type=float, default=1e-4)
     parser.add_argument("-wd","--weight_decay", type=float, default=0.1)
@@ -600,8 +683,23 @@ def main():
         log_interval=args.log_interval,
         save_interval=args.save_interval,
     )
-    
-    train(config, args.resume_from)
+
+    # Update run_name with simplified attention/model type names
+    if not args.run_name:
+        if args.model_type == "mamba3":
+            arch_name = "mamba3"
+        elif attention_type == AttentionType.NATIVE_SPARSE_ATTENTION:
+            arch_name = "nsa"
+        elif attention_type == AttentionType.DENSE:
+            arch_name = "dense"
+        elif attention_type == AttentionType.FLASH_SPARSE_ATTENTION:
+            arch_name = "fsa"
+        else:
+            arch_name = attention_type.value
+
+        config.run_name = f"{model_size.value}_{arch_name}_{optimizer_type.value}_ctx{args.context_length}"
+
+    train(config, args.resume_from, model_type=args.model_type)
 
 
 if __name__ == "__main__":

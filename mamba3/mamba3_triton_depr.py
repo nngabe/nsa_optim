@@ -236,12 +236,11 @@ if TRITON_AVAILABLE:
             b_prev = b_t
             x_prev = x_t
         
-        # Store final state
-        for n in range(STATE_DIM):
-            for p in range(HEAD_DIM):
-                if n < BLOCK_N and p < BLOCK_P:
-                    h_idx = pid_b * stride_hb + pid_h * stride_hh + n * stride_hn + p * stride_hp
-                    tl.store(H_FINAL + h_idx, h[n, p].to(X.dtype.element_ty))
+        # Store final state using vectorized operations
+        h_idx = (pid_b * stride_hb + pid_h * stride_hh +
+                 n_range[:, None] * stride_hn + p_range[None, :] * stride_hp)
+        mask_2d = n_mask[:, None] & p_mask[None, :]
+        tl.store(H_FINAL + h_idx, h.to(X.dtype.element_ty), mask=mask_2d)
 
 
     @triton.jit
@@ -409,7 +408,7 @@ class TritonRMSNorm(torch.autograd.Function):
         ctx.save_for_backward(x_flat, weight)
         ctx.eps = eps
         ctx.orig_shape = orig_shape
-
+        
         return y.reshape(orig_shape)
     
     @staticmethod
@@ -420,15 +419,15 @@ class TritonRMSNorm(torch.autograd.Function):
         x_float = x.float()
         rms = torch.sqrt(x_float.pow(2).mean(-1, keepdim=True) + ctx.eps)
         x_norm = x_float / rms
-
+        
         dy_flat = dy.reshape(-1, dy.shape[-1]).float()
-
+        
         # dx
         dx = (dy_flat * weight - x_norm * (dy_flat * weight * x_norm).mean(-1, keepdim=True)) / rms
-
+        
         # dw
         dw = (dy_flat * x_norm).sum(0)
-
+        
         return dx.reshape(ctx.orig_shape).to(dy.dtype), dw.to(weight.dtype), None
 
 
@@ -439,15 +438,14 @@ def triton_rms_norm(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
 
 class TritonRoPE(torch.autograd.Function):
     """Triton-accelerated data-dependent RoPE."""
-
+    
     @staticmethod
     @custom_fwd(device_type='cuda')
     def forward(ctx, x: Tensor, freqs: Tensor) -> Tensor:
         if not TRITON_AVAILABLE or not x.is_cuda:
             # Fallback
             x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-            freqs_f = freqs.float()
-            freqs_complex = torch.polar(torch.ones_like(freqs_f), freqs_f)
+            freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
             x_rotated = x_complex * freqs_complex
             return torch.view_as_real(x_rotated).flatten(-2).to(x.dtype)
         
@@ -478,8 +476,7 @@ class TritonRoPE(torch.autograd.Function):
         freqs, x = ctx.saved_tensors
         # Backward RoPE is RoPE with negated frequencies
         x_complex = torch.view_as_complex(dy.float().reshape(*dy.shape[:-1], -1, 2))
-        freqs_f = freqs.float()
-        freqs_complex = torch.polar(torch.ones_like(freqs_f), -freqs_f)  # Negative for transpose
+        freqs_complex = torch.polar(torch.ones_like(freqs.float()), -freqs.float())  # Negative for transpose
         dx_complex = x_complex * freqs_complex
         dx = torch.view_as_real(dx_complex).flatten(-2).to(dy.dtype)
 
@@ -487,6 +484,7 @@ class TritonRoPE(torch.autograd.Function):
         x_pairs = x.float().reshape(*x.shape[:-1], -1, 2)
         dy_pairs = dy.float().reshape(*dy.shape[:-1], -1, 2)
 
+        freqs_f = freqs.float()
         cos_f = torch.cos(freqs_f)
         sin_f = torch.sin(freqs_f)
 
@@ -519,19 +517,9 @@ class RMSNorm(nn.Module):
         return triton_rms_norm(x, self.weight, self.eps)
 
 
-class ChunkedScanFunction(torch.autograd.Function):
+class SelectiveScanTriton(torch.autograd.Function):
     """
-    Chunked parallel scan with trapezoidal discretization.
-    
-    This uses the SSD (State Space Duality) algorithm:
-    1. Intra-chunk: Quadratic computation (parallel matmuls)
-    2. Inter-chunk: Parallel associative scan for state propagation
-    
-    For sequence length L and chunk size C:
-    - O(L * C * N) parallel work for intra-chunk
-    - O(log(L/C) * N * P) for inter-chunk scan
-    
-    This gives ~10-100x speedup over sequential scan for long sequences.
+    Selective scan with trapezoidal discretization using Triton.
     """
     
     @staticmethod
@@ -544,12 +532,10 @@ class ChunkedScanFunction(torch.autograd.Function):
         alpha: Tensor,   # (B, L, H)
         beta: Tensor,    # (B, L, H)
         gamma: Tensor,   # (B, L, H)
-        chunk_size: int = 256,
     ) -> Tuple[Tensor, Tensor]:
         batch, seq_len, n_heads, head_dim = x.shape
         state_dim = B.shape[-1]
         device = x.device
-        dtype = x.dtype
         
         # Ensure contiguous
         x = x.contiguous()
@@ -559,291 +545,110 @@ class ChunkedScanFunction(torch.autograd.Function):
         beta = beta.contiguous()
         gamma = gamma.contiguous()
         
-        # Pad to multiple of chunk_size
-        pad_len = (chunk_size - seq_len % chunk_size) % chunk_size
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, 0, 0, pad_len))
-            B = F.pad(B, (0, 0, 0, 0, 0, pad_len))
-            C = F.pad(C, (0, 0, 0, 0, 0, pad_len))
-            alpha = F.pad(alpha, (0, 0, 0, pad_len), value=1.0)
-            beta = F.pad(beta, (0, 0, 0, pad_len), value=0.0)
-            gamma = F.pad(gamma, (0, 0, 0, pad_len), value=0.0)
+        y = torch.empty_like(x)
+        h_final = torch.zeros(batch, n_heads, state_dim, head_dim, device=device, dtype=x.dtype)
         
-        L_padded = x.shape[1]
-        n_chunks = L_padded // chunk_size
-        
-        # Reshape into chunks: (B, n_chunks, C, H, ...)
-        x_chunks = rearrange(x, 'b (nc c) h p -> b nc c h p', c=chunk_size)
-        B_chunks = rearrange(B, 'b (nc c) h n -> b nc c h n', c=chunk_size)
-        C_chunks = rearrange(C, 'b (nc c) h n -> b nc c h n', c=chunk_size)
-        alpha_chunks = rearrange(alpha, 'b (nc c) h -> b nc c h', c=chunk_size)
-        beta_chunks = rearrange(beta, 'b (nc c) h -> b nc c h', c=chunk_size)
-        gamma_chunks = rearrange(gamma, 'b (nc c) h -> b nc c h', c=chunk_size)
-        
-        # ============================================================
-        # Step 1: Compute intra-chunk outputs using quadratic form
-        # ============================================================
-        y_intra = _compute_intra_chunk_quadratic(
-            x_chunks, B_chunks, C_chunks,
-            alpha_chunks, beta_chunks, gamma_chunks,
-            chunk_size
-        )
-        
-        # ============================================================
-        # Step 2: Compute chunk-to-chunk state transitions
-        # ============================================================
-        log_alpha_chunks = torch.log(alpha_chunks.clamp(min=1e-6))
-        log_decay_total = log_alpha_chunks.sum(dim=2)  # (B, nc, H)
-        
-        state_delta = _compute_chunk_state_delta(
-            x_chunks, B_chunks, alpha_chunks, beta_chunks, gamma_chunks, chunk_size
-        )  # (B, nc, H, N, P)
-        
-        # ============================================================
-        # Step 3: Parallel scan to propagate states across chunks
-        # ============================================================
-        state_delta_shifted = F.pad(state_delta[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
-        log_decay_shifted = F.pad(log_decay_total[:, :-1], (0, 0, 1, 0), value=0.0)
-        log_decay_cumsum = torch.cumsum(log_decay_shifted, dim=1)
-        
-        h_init = _parallel_state_scan(log_decay_cumsum, state_delta_shifted)
-        
-        # ============================================================
-        # Step 4: Add contribution from initial states
-        # ============================================================
-        log_alpha_cumsum_intra = torch.cumsum(log_alpha_chunks, dim=2)
-        decay_from_init = torch.exp(log_alpha_cumsum_intra)
-        
-        h_decayed = decay_from_init.unsqueeze(-1).unsqueeze(-1) * h_init.unsqueeze(2)
-        y_from_init = torch.einsum('bcthn,bcthmp->bcthp', C_chunks, h_decayed)
-        
-        # ============================================================
-        # Step 5: Combine and reshape
-        # ============================================================
-        y_total = y_intra + y_from_init
-        y = rearrange(y_total, 'b nc c h p -> b (nc c) h p')
-        
-        if pad_len > 0:
-            y = y[:, :seq_len]
-        
-        final_state = h_init[:, -1] + state_delta[:, -1]
+        # Triton kernel only efficient for short sequences due to sequential loop
+        # For longer sequences, use PyTorch implementation
+        use_triton = (TRITON_AVAILABLE and x.is_cuda and
+                     state_dim <= 128 and head_dim <= 128 and seq_len <= 512)
+
+        if use_triton:
+            BLOCK_N = min(64, triton.next_power_of_2(state_dim))
+            BLOCK_P = min(64, triton.next_power_of_2(head_dim))
+
+            grid = (batch, n_heads)
+
+            _selective_scan_fwd_kernel[grid](
+                x, B, C, alpha, beta, gamma,
+                y, h_final,
+                x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+                B.stride(0), B.stride(1), B.stride(2), B.stride(3),
+                alpha.stride(0), alpha.stride(1), alpha.stride(2),
+                y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+                h_final.stride(0), h_final.stride(1), h_final.stride(2), h_final.stride(3),
+                seq_len, n_heads, head_dim, state_dim,
+                BLOCK_P=BLOCK_P, BLOCK_N=BLOCK_N,
+            )
+        else:
+            # Fallback to sequential scan
+            h = torch.zeros(batch, n_heads, state_dim, head_dim, device=device, dtype=x.dtype)
+            
+            for t in range(seq_len):
+                if t > 0:
+                    Bx_prev = torch.einsum('bhn,bhp->bhnp', B[:, t-1], x[:, t-1])
+                    h = alpha[:, t, :, None, None] * h + beta[:, t, :, None, None] * Bx_prev
+                
+                Bx_curr = torch.einsum('bhn,bhp->bhnp', B[:, t], x[:, t])
+                h = h + gamma[:, t, :, None, None] * Bx_curr
+                
+                y[:, t] = torch.einsum('bhn,bhnp->bhp', C[:, t], h)
+            
+            h_final = h
         
         ctx.save_for_backward(x, B, C, alpha, beta, gamma)
-        ctx.chunk_size = chunk_size
-        ctx.pad_len = pad_len
-        
-        return y, final_state
+        return y, h_final
     
     @staticmethod
     @custom_bwd(device_type='cuda')
     def backward(ctx, dy: Tensor, dh_final: Tensor):
         x, B, C, alpha, beta, gamma = ctx.saved_tensors
-        chunk_size = ctx.chunk_size
-        pad_len = ctx.pad_len
-
-        # Pad dy to match padded sequence length
-        if pad_len > 0:
-            dy = F.pad(dy, (0, 0, 0, 0, 0, pad_len))
-
-        # Recompute forward operations with gradient tracking (not using apply to avoid recursion)
-        with torch.enable_grad():
-            x = x.detach().requires_grad_(True)
-            B = B.detach().requires_grad_(True)
-            C = C.detach().requires_grad_(True)
-            alpha = alpha.detach().requires_grad_(True)
-            beta = beta.detach().requires_grad_(True)
-            gamma = gamma.detach().requires_grad_(True)
-
-            # x, B, C, alpha, beta, gamma are already padded from forward
-            L_padded = x.shape[1]
-            n_chunks = L_padded // chunk_size
-
-            # Reshape into chunks
-            x_chunks = rearrange(x, 'b (nc c) h p -> b nc c h p', c=chunk_size)
-            B_chunks = rearrange(B, 'b (nc c) h n -> b nc c h n', c=chunk_size)
-            C_chunks = rearrange(C, 'b (nc c) h n -> b nc c h n', c=chunk_size)
-            alpha_chunks = rearrange(alpha, 'b (nc c) h -> b nc c h', c=chunk_size)
-            beta_chunks = rearrange(beta, 'b (nc c) h -> b nc c h', c=chunk_size)
-            gamma_chunks = rearrange(gamma, 'b (nc c) h -> b nc c h', c=chunk_size)
-
-            # Intra-chunk computation
-            y_intra = _compute_intra_chunk_quadratic(
-                x_chunks, B_chunks, C_chunks,
-                alpha_chunks, beta_chunks, gamma_chunks,
-                chunk_size
-            )
-
-            # Inter-chunk state propagation
-            log_alpha_chunks = torch.log(alpha_chunks.clamp(min=1e-6))
-            log_decay_total = log_alpha_chunks.sum(dim=2)
-
-            state_delta = _compute_chunk_state_delta(
-                x_chunks, B_chunks, alpha_chunks, beta_chunks, gamma_chunks, chunk_size
-            )
-
-            state_delta_shifted = F.pad(state_delta[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
-            log_decay_shifted = F.pad(log_decay_total[:, :-1], (0, 0, 1, 0), value=0.0)
-            log_decay_cumsum = torch.cumsum(log_decay_shifted, dim=1)
-
-            h_init = _parallel_state_scan(log_decay_cumsum, state_delta_shifted)
-
-            # Contribution from initial states
-            log_alpha_cumsum_intra = torch.cumsum(log_alpha_chunks, dim=2)
-            decay_from_init = torch.exp(log_alpha_cumsum_intra)
-
-            h_decayed = decay_from_init.unsqueeze(-1).unsqueeze(-1) * h_init.unsqueeze(2)
-            y_from_init = torch.einsum('bcthn,bcthmp->bcthp', C_chunks, h_decayed)
-
-            # Combine
-            y_total = y_intra + y_from_init
-            y = rearrange(y_total, 'b nc c h p -> b (nc c) h p')
-            final_state = h_init[:, -1] + state_delta[:, -1]
-
-            # Compute gradients
-            grads = torch.autograd.grad(
-                outputs=[y, final_state],
-                inputs=[x, B, C, alpha, beta, gamma],
-                grad_outputs=[dy, dh_final],
-                allow_unused=True,
-            )
-
-        # Unpad gradients to match original input shapes
-        dx, dB, dC, dalpha, dbeta, dgamma = grads
-        if pad_len > 0:
-            seq_len = dx.shape[1] - pad_len
-            dx = dx[:, :seq_len] if dx is not None else None
-            dB = dB[:, :seq_len] if dB is not None else None
-            dC = dC[:, :seq_len] if dC is not None else None
-            dalpha = dalpha[:, :seq_len] if dalpha is not None else None
-            dbeta = dbeta[:, :seq_len] if dbeta is not None else None
-            dgamma = dgamma[:, :seq_len] if dgamma is not None else None
-
-        return dx, dB, dC, dalpha, dbeta, dgamma, None
-
-
-def _compute_intra_chunk_quadratic(
-    x: Tensor,      # (B, nc, C, H, P)
-    B: Tensor,      # (B, nc, C, H, N)
-    C: Tensor,      # (B, nc, C, H, N)
-    alpha: Tensor,  # (B, nc, C, H)
-    beta: Tensor,   # (B, nc, C, H)
-    gamma: Tensor,  # (B, nc, C, H)
-    chunk_size: int,
-) -> Tensor:
-    """
-    Compute intra-chunk outputs using quadratic (dual) form.
-    Y = (M ⊙ CB^T) @ X where M is the masked trapezoidal coefficient matrix.
-    """
-    batch, n_chunks, C_dim, n_heads, head_dim = x.shape
-    state_dim = B.shape[-1]
-    device = x.device
-    dtype = x.dtype
-    
-    # Compute decay matrix (only lower triangular to avoid inf*0=nan)
-    log_alpha = torch.log(alpha.clamp(min=1e-6))
-    log_cumsum = torch.cumsum(log_alpha, dim=2)
-
-    # Create indices for lower triangular
-    t_idx = torch.arange(C_dim, device=device).view(C_dim, 1)
-    s_idx = torch.arange(C_dim, device=device).view(1, C_dim)
-    causal_mask = (t_idx >= s_idx).to(dtype)
-
-    # Compute log_decay only where causal_mask is 1, otherwise use -inf
-    log_decay = log_cumsum.unsqueeze(3) - log_cumsum.unsqueeze(2)
-    log_decay = torch.where(causal_mask.view(1, 1, C_dim, C_dim, 1).bool(),
-                           log_decay,
-                           torch.tensor(-float('inf'), device=device, dtype=dtype))
-    decay = torch.exp(log_decay.clamp(max=80))  # Clamp to avoid overflow
-    
-    # Trapezoidal coefficients
-    coef = torch.zeros(batch, n_chunks, C_dim, C_dim, n_heads, device=device, dtype=dtype)
-    
-    # Diagonal: gamma
-    diag_idx = torch.arange(C_dim, device=device)
-    coef[:, :, diag_idx, diag_idx, :] = gamma
-    
-    # Below diagonal: beta[s+1]
-    for t in range(1, C_dim):
-        for s in range(t):
-            if s + 1 < C_dim:
-                coef[:, :, t, s, :] = beta[:, :, s + 1, :]
-    
-    M = decay * coef
-    
-    # CB^T: Contract over state_dim (n)
-    # C: (batch, n_chunks, time_t, n_heads, state_dim)
-    # B: (batch, n_chunks, time_s, n_heads, state_dim)
-    # Output: (batch, n_chunks, time_t, time_s, n_heads)
-    CB = torch.einsum('bcthn,bcshn->bctsh', C, B)
-
-    # MCB @ X
-    MCB = M * CB
-    y = torch.einsum('bctsh,bcshp->bcthp', MCB, x)
-    
-    return y
-
-
-def _compute_chunk_state_delta(
-    x: Tensor,
-    B: Tensor,
-    alpha: Tensor,
-    beta: Tensor,
-    gamma: Tensor,
-    chunk_size: int,
-) -> Tensor:
-    """Compute final state delta for each chunk (from zero initial state)."""
-    batch, n_chunks, C_dim, n_heads, head_dim = x.shape
-    state_dim = B.shape[-1]
-    device = x.device
-    dtype = x.dtype
-    
-    log_alpha = torch.log(alpha.clamp(min=1e-6))
-    log_cumsum = torch.cumsum(log_alpha, dim=2)
-    log_total = log_cumsum[:, :, -1:, :]
-    
-    decay_to_end = torch.exp(log_total - log_cumsum)
-    
-    Bx = torch.einsum('bcthn,bcthp->bcthnp', B, x)
-    state_curr = gamma.unsqueeze(-1).unsqueeze(-1) * Bx
-    
-    Bx_shifted = F.pad(Bx[:, :, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
-    state_prev = beta.unsqueeze(-1).unsqueeze(-1) * Bx_shifted
-    
-    state_contrib = state_curr + state_prev
-    state_delta = (decay_to_end.unsqueeze(-1).unsqueeze(-1) * state_contrib).sum(dim=2)
-    
-    return state_delta
-
-
-def _parallel_state_scan(
-    log_decay_cumsum: Tensor,
-    state_delta: Tensor,
-) -> Tensor:
-    """Parallel scan for inter-chunk state propagation."""
-    batch, n_chunks, n_heads = log_decay_cumsum.shape
-    
-    if n_chunks <= 64:
-        # Quadratic but highly parallel
-        decay_matrix = torch.exp(
-            log_decay_cumsum.unsqueeze(2) - log_decay_cumsum.unsqueeze(1)
-        )
-        causal = torch.tril(torch.ones(n_chunks, n_chunks, device=log_decay_cumsum.device, dtype=state_delta.dtype), diagonal=-1)
-        decay_matrix = decay_matrix * causal.view(1, n_chunks, n_chunks, 1)
+        batch, seq_len, n_heads, head_dim = x.shape
+        state_dim = B.shape[-1]
+        device = x.device
         
-        h_init = torch.einsum('bith,bjhnp->bihnp', decay_matrix, state_delta)
-        return h_init
-    else:
-        # Sequential fallback for very long sequences
-        h_init = torch.zeros_like(state_delta)
-        h = torch.zeros_like(state_delta[:, 0])
+        # Backward pass (simplified, can be optimized further)
+        dx = torch.zeros_like(x)
+        dB = torch.zeros_like(B)
+        dC = torch.zeros_like(C)
+        dalpha = torch.zeros_like(alpha)
+        dbeta = torch.zeros_like(beta)
+        dgamma = torch.zeros_like(gamma)
         
-        for i in range(n_chunks):
-            h_init[:, i] = h
-            if i < n_chunks - 1:
-                decay = torch.exp(log_decay_cumsum[:, i+1] - log_decay_cumsum[:, i])
-                h = decay.unsqueeze(-1).unsqueeze(-1) * h + state_delta[:, i]
+        # Recompute forward states for backward
+        states = []
+        h = torch.zeros(batch, n_heads, state_dim, head_dim, device=device, dtype=x.dtype)
         
-        return h_init
+        for t in range(seq_len):
+            if t > 0:
+                Bx_prev = torch.einsum('bhn,bhp->bhnp', B[:, t-1], x[:, t-1])
+                h = alpha[:, t, :, None, None] * h + beta[:, t, :, None, None] * Bx_prev
+            
+            Bx_curr = torch.einsum('bhn,bhp->bhnp', B[:, t], x[:, t])
+            h = h + gamma[:, t, :, None, None] * Bx_curr
+            states.append(h.clone())
+        
+        # Backward through time
+        dh = dh_final.clone()
+        
+        for t in range(seq_len - 1, -1, -1):
+            h_t = states[t]
+            
+            # dy_t contribution to dC and dh
+            dC[:, t] = torch.einsum('bhp,bhnp->bhn', dy[:, t], h_t)
+            dh = dh + torch.einsum('bhn,bhp->bhnp', C[:, t], dy[:, t])
+            
+            # Current step
+            dgamma[:, t] = (dh * torch.einsum('bhn,bhp->bhnp', B[:, t], x[:, t])).sum(dim=(-2, -1))
+            dB[:, t] = dB[:, t] + torch.einsum('bhnp,bhp->bhn', dh * gamma[:, t, :, None, None], x[:, t])
+            dx[:, t] = dx[:, t] + torch.einsum('bhnp,bhn->bhp', dh * gamma[:, t, :, None, None], B[:, t])
+            
+            if t > 0:
+                # Previous step contribution
+                h_prev = states[t - 1] if t > 1 else torch.zeros_like(h_t)
+                
+                dalpha[:, t] = (dh * h_prev).sum(dim=(-2, -1))
+                dbeta[:, t] = (dh * torch.einsum('bhn,bhp->bhnp', B[:, t-1], x[:, t-1])).sum(dim=(-2, -1))
+                
+                dB[:, t-1] = dB[:, t-1] + torch.einsum('bhnp,bhp->bhn', dh * beta[:, t, :, None, None], x[:, t-1])
+                dx[:, t-1] = dx[:, t-1] + torch.einsum('bhnp,bhn->bhp', dh * beta[:, t, :, None, None], B[:, t-1])
+                
+                # Propagate gradient
+                dh = alpha[:, t, :, None, None] * dh
+            else:
+                dh = torch.zeros_like(dh)
+        
+        return dx, dB, dC, dalpha, dbeta, dgamma
 
 
 def selective_scan_trapezoidal(
@@ -853,19 +658,9 @@ def selective_scan_trapezoidal(
     alpha: Tensor,
     beta: Tensor,
     gamma: Tensor,
-    chunk_size: int = 256,
 ) -> Tuple[Tensor, Tensor]:
-    """
-    Chunked parallel selective scan with trapezoidal discretization.
-    
-    This is highly optimized for long sequences using:
-    - Intra-chunk quadratic computation (parallel matmuls)
-    - Inter-chunk parallel associative scan
-    
-    For 8192 context with chunk_size=256, this gives ~10-50x speedup
-    over sequential scan.
-    """
-    return ChunkedScanFunction.apply(x, B, C, alpha, beta, gamma, chunk_size)
+    """Selective scan with trapezoidal discretization."""
+    return SelectiveScanTriton.apply(x, B, C, alpha, beta, gamma)
 
 
 # ============================================================================
@@ -880,7 +675,7 @@ class Mamba3Mixer(nn.Module):
     - Trapezoidal discretization
     - Data-dependent RoPE (complex SSM)
     - Optional MIMO
-    - Chunked parallel scan for efficient training
+    - Fused operations where possible
     """
     
     def __init__(self, config: Mamba3Config, layer_idx: int = 0):
@@ -893,7 +688,6 @@ class Mamba3Mixer(nn.Module):
         self.d_state = config.d_state
         self.n_heads = config.n_heads
         self.head_dim = config.head_dim
-        self.chunk_size = config.chunk_size
         self.use_triton = config.use_triton and TRITON_AVAILABLE
         
         # Combined input projection
@@ -1008,16 +802,11 @@ class Mamba3Mixer(nn.Module):
         beta = (1 - lam) * dt * alpha
         gamma = lam * dt
         
-        # SSM with chunked parallel scan for training, recurrent for inference
+        # SSM
         if cache is not None:
-            # Recurrent mode for inference
             y, new_cache = self._recurrent_step(x_proj, B, C, alpha, beta, gamma, cache)
         else:
-            # Chunked parallel scan for training
-            y, _ = selective_scan_trapezoidal(
-                x_proj, B, C, alpha, beta, gamma, 
-                chunk_size=self.chunk_size
-            )
+            y, _ = selective_scan_trapezoidal(x_proj, B, C, alpha, beta, gamma)
             new_cache = None
         
         # Output
@@ -1265,7 +1054,6 @@ def benchmark_kernels(
     n_heads: int = 32,
     head_dim: int = 64,
     d_state: int = 128,
-    chunk_size: int = 256,
     warmup: int = 10,
     repeats: int = 100,
 ):
@@ -1283,7 +1071,6 @@ def benchmark_kernels(
     print("=" * 70)
     print(f"Config: batch={batch}, seq_len={seq_len}, d_model={d_model}")
     print(f"        n_heads={n_heads}, head_dim={head_dim}, d_state={d_state}")
-    print(f"        chunk_size={chunk_size}")
     print()
     
     # RMSNorm benchmark
@@ -1338,8 +1125,7 @@ def benchmark_kernels(
     # PyTorch fallback
     def pytorch_rope(x, freqs):
         x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_f = freqs.float()
-        freqs_complex = torch.polar(torch.ones_like(freqs_f), freqs_f)
+        freqs_complex = torch.polar(torch.ones_like(freqs.float()), freqs.float())
         return torch.view_as_real(x_complex * freqs_complex).flatten(-2).to(x.dtype)
     
     for _ in range(warmup):
@@ -1357,163 +1143,30 @@ def benchmark_kernels(
     print(f"   Speedup: {pytorch_time / triton_time:.2f}x")
     print()
     
-    # Chunked Selective Scan benchmark
-    print("3. Chunked Selective Scan (Trapezoidal)")
+    # Selective Scan benchmark
+    print("3. Selective Scan (Trapezoidal)")
     x = torch.randn(batch, seq_len, n_heads, head_dim, device=device, dtype=torch.float32)
     B = torch.randn(batch, seq_len, n_heads, d_state, device=device, dtype=torch.float32)
     C = torch.randn(batch, seq_len, n_heads, d_state, device=device, dtype=torch.float32)
-    alpha = torch.rand(batch, seq_len, n_heads, device=device) * 0.3 + 0.7
+    alpha = torch.rand(batch, seq_len, n_heads, device=device) * 0.5 + 0.5
     beta = torch.rand(batch, seq_len, n_heads, device=device) * 0.1
     gamma = torch.rand(batch, seq_len, n_heads, device=device) * 0.1
     
-    # Warmup chunked
     for _ in range(warmup):
-        _, _ = selective_scan_trapezoidal(x, B, C, alpha, beta, gamma, chunk_size)
+        _, _ = selective_scan_trapezoidal(x, B, C, alpha, beta, gamma)
     torch.cuda.synchronize()
     
     start = time.time()
     for _ in range(repeats):
-        _, _ = selective_scan_trapezoidal(x, B, C, alpha, beta, gamma, chunk_size)
+        _, _ = selective_scan_trapezoidal(x, B, C, alpha, beta, gamma)
     torch.cuda.synchronize()
-    chunked_time = (time.time() - start) / repeats * 1000
+    scan_time = (time.time() - start) / repeats * 1000
     
-    tokens_per_sec = batch * seq_len / (chunked_time / 1000)
-    
-    print(f"   Chunked scan time: {chunked_time:.3f} ms")
-    print(f"   Throughput: {tokens_per_sec:.0f} tokens/sec")
-    print(f"   Time per token: {chunked_time * 1000 / (batch * seq_len):.3f} µs")
-    
-    # Compare with sequential for shorter sequences
-    if seq_len <= 2048:
-        print("\n   Comparing with sequential scan...")
-        
-        def sequential_scan(x, B, C, alpha, beta, gamma):
-            batch, seq_len, n_heads, head_dim = x.shape
-            state_dim = B.shape[-1]
-            h = torch.zeros(batch, n_heads, state_dim, head_dim, device=x.device, dtype=x.dtype)
-            outputs = []
-            for t in range(seq_len):
-                if t > 0:
-                    Bx_prev = torch.einsum('bhn,bhp->bhnp', B[:, t-1], x[:, t-1])
-                    h = alpha[:, t, :, None, None] * h + beta[:, t, :, None, None] * Bx_prev
-                Bx_curr = torch.einsum('bhn,bhp->bhnp', B[:, t], x[:, t])
-                h = h + gamma[:, t, :, None, None] * Bx_curr
-                y_t = torch.einsum('bhn,bhnp->bhp', C[:, t], h)
-                outputs.append(y_t)
-            return torch.stack(outputs, dim=1), h
-        
-        # Warmup sequential
-        for _ in range(min(3, warmup)):
-            _, _ = sequential_scan(x, B, C, alpha, beta, gamma)
-        torch.cuda.synchronize()
-        
-        start = time.time()
-        for _ in range(min(10, repeats)):
-            _, _ = sequential_scan(x, B, C, alpha, beta, gamma)
-        torch.cuda.synchronize()
-        seq_time = (time.time() - start) / min(10, repeats) * 1000
-        
-        print(f"   Sequential scan time: {seq_time:.3f} ms")
-        print(f"   Speedup: {seq_time / chunked_time:.1f}x")
-        
-        # Verify correctness
-        y_chunked, _ = selective_scan_trapezoidal(x, B, C, alpha, beta, gamma, chunk_size)
-        y_seq, _ = sequential_scan(x, B, C, alpha, beta, gamma)
-        diff = (y_chunked - y_seq).abs().max().item()
-        print(f"   Max error: {diff:.2e}")
-    
-    print()
-    print("=" * 70)
-
-
-def benchmark_training_throughput(
-    batch: int = 4,
-    seq_len: int = 8192,
-    d_model: int = 2048,
-    n_layers: int = 24,
-    chunk_size: int = 256,
-    warmup: int = 5,
-    repeats: int = 20,
-):
-    """Benchmark full model training throughput."""
-    import time
-    
-    if not torch.cuda.is_available():
-        print("CUDA not available")
-        return
-    
-    device = 'cuda'
-    dtype = torch.bfloat16
-    
-    print("=" * 70)
-    print("Mamba-3 Training Throughput Benchmark")
-    print("=" * 70)
-    print(f"Config: batch={batch}, seq_len={seq_len}, d_model={d_model}")
-    print(f"        n_layers={n_layers}, chunk_size={chunk_size}")
+    print(f"   Time: {scan_time:.3f} ms")
+    print(f"   Throughput: {batch * seq_len / scan_time * 1000:.0f} tokens/s")
     print()
     
-    config = Mamba3Config(
-        d_model=d_model,
-        n_layers=n_layers,
-        chunk_size=chunk_size,
-        use_triton=True,
-        gradient_checkpointing=True,
-    )
-    
-    model = Mamba3Model(config).to(device).to(dtype)
-    
-    # Count parameters
-    n_params = model.get_num_params()
-    print(f"Model parameters: {n_params / 1e6:.1f}M")
-    
-    # Create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    
-    # Test input
-    input_ids = torch.randint(0, config.vocab_size, (batch, seq_len), device=device)
-    labels = torch.randint(0, config.vocab_size, (batch, seq_len), device=device)
-    
-    # Warmup
-    print("Warming up...")
-    for _ in range(warmup):
-        optimizer.zero_grad()
-        logits, _ = model(input_ids)
-        loss = F.cross_entropy(logits.view(-1, config.vocab_size), labels.view(-1))
-        loss.backward()
-        optimizer.step()
-    torch.cuda.synchronize()
-    
-    # Benchmark
-    print("Benchmarking...")
-    torch.cuda.synchronize()
-    start = time.time()
-    
-    for _ in range(repeats):
-        optimizer.zero_grad()
-        logits, _ = model(input_ids)
-        loss = F.cross_entropy(logits.view(-1, config.vocab_size), labels.view(-1))
-        loss.backward()
-        optimizer.step()
-    
-    torch.cuda.synchronize()
-    elapsed = time.time() - start
-    
-    time_per_step = elapsed / repeats
-    tokens_per_step = batch * seq_len
-    tokens_per_sec = tokens_per_step / time_per_step
-    
-    print(f"\nResults:")
-    print(f"  Time per step: {time_per_step * 1000:.1f} ms")
-    print(f"  Tokens per step: {tokens_per_step:,}")
-    print(f"  Training throughput: {tokens_per_sec:.0f} tokens/sec")
-    print(f"  MFU estimate: {tokens_per_sec * n_params * 6 / 1e12:.1f} TFLOPS")
-    
-    # Memory usage
-    torch.cuda.synchronize()
-    mem_allocated = torch.cuda.max_memory_allocated() / 1e9
-    print(f"  Peak GPU memory: {mem_allocated:.1f} GB")
-    
-    return tokens_per_sec
+    print("=" * 70)
 
 
 # ============================================================================

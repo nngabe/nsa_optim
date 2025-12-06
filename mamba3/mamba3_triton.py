@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.amp import autocast, custom_fwd, custom_bwd
+from torch.amp import custom_fwd, custom_bwd
 
 try:
     import triton
@@ -236,12 +236,11 @@ if TRITON_AVAILABLE:
             b_prev = b_t
             x_prev = x_t
         
-        # Store final state
-        for n in range(STATE_DIM):
-            for p in range(HEAD_DIM):
-                if n < BLOCK_N and p < BLOCK_P:
-                    h_idx = pid_b * stride_hb + pid_h * stride_hh + n * stride_hn + p * stride_hp
-                    tl.store(H_FINAL + h_idx, h[n, p].to(X.dtype.element_ty))
+        # Store final state using vectorized operations
+        h_idx = (pid_b * stride_hb + pid_h * stride_hh +
+                 n_range[:, None] * stride_hn + p_range[None, :] * stride_hp)
+        mask_2d = n_mask[:, None] & p_mask[None, :]
+        tl.store(H_FINAL + h_idx, h.to(X.dtype.element_ty), mask=mask_2d)
 
 
     @triton.jit
@@ -383,7 +382,7 @@ class TritonRMSNorm(torch.autograd.Function):
     """Triton-accelerated RMSNorm with autograd support."""
     
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type='cuda')
     def forward(ctx, x: Tensor, weight: Tensor, eps: float) -> Tensor:
         if not TRITON_AVAILABLE or not x.is_cuda:
             # Fallback to PyTorch
@@ -392,7 +391,7 @@ class TritonRMSNorm(torch.autograd.Function):
             return ((x_float / rms) * weight).to(x.dtype)
         
         orig_shape = x.shape
-        x_flat = x.view(-1, orig_shape[-1]).contiguous()
+        x_flat = x.reshape(-1, orig_shape[-1]).contiguous()
         y = torch.empty_like(x_flat)
         
         N = x_flat.shape[-1]
@@ -410,10 +409,10 @@ class TritonRMSNorm(torch.autograd.Function):
         ctx.eps = eps
         ctx.orig_shape = orig_shape
         
-        return y.view(orig_shape)
+        return y.reshape(orig_shape)
     
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type='cuda')
     def backward(ctx, dy: Tensor):
         x, weight = ctx.saved_tensors
         # Use PyTorch for backward (can be optimized with Triton too)
@@ -421,7 +420,7 @@ class TritonRMSNorm(torch.autograd.Function):
         rms = torch.sqrt(x_float.pow(2).mean(-1, keepdim=True) + ctx.eps)
         x_norm = x_float / rms
         
-        dy_flat = dy.view(-1, dy.shape[-1]).float()
+        dy_flat = dy.reshape(-1, dy.shape[-1]).float()
         
         # dx
         dx = (dy_flat * weight - x_norm * (dy_flat * weight * x_norm).mean(-1, keepdim=True)) / rms
@@ -429,7 +428,7 @@ class TritonRMSNorm(torch.autograd.Function):
         # dw
         dw = (dy_flat * x_norm).sum(0)
         
-        return dx.view(ctx.orig_shape).to(dy.dtype), dw.to(weight.dtype), None
+        return dx.reshape(ctx.orig_shape).to(dy.dtype), dw.to(weight.dtype), None
 
 
 def triton_rms_norm(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
@@ -441,7 +440,7 @@ class TritonRoPE(torch.autograd.Function):
     """Triton-accelerated data-dependent RoPE."""
     
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type='cuda')
     def forward(ctx, x: Tensor, freqs: Tensor) -> Tensor:
         if not TRITON_AVAILABLE or not x.is_cuda:
             # Fallback
@@ -472,7 +471,7 @@ class TritonRoPE(torch.autograd.Function):
         return y
     
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type='cuda')
     def backward(ctx, dy: Tensor):
         freqs, x = ctx.saved_tensors
         # Backward RoPE is RoPE with negated frequencies
@@ -523,7 +522,7 @@ class SelectiveScanTriton(torch.autograd.Function):
     """
     
     @staticmethod
-    @custom_fwd
+    @custom_fwd(device_type='cuda')
     def forward(
         ctx,
         x: Tensor,       # (B, L, H, P)
@@ -585,7 +584,7 @@ class SelectiveScanTriton(torch.autograd.Function):
         return y, h_final
     
     @staticmethod
-    @custom_bwd
+    @custom_bwd(device_type='cuda')
     def backward(ctx, dy: Tensor, dh_final: Tensor):
         x, B, C, alpha, beta, gamma = ctx.saved_tensors
         batch, seq_len, n_heads, head_dim = x.shape
@@ -1120,7 +1119,7 @@ def benchmark_kernels(
     # PyTorch fallback
     def pytorch_rope(x, freqs):
         x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_complex = torch.polar(torch.ones_like(freqs), freqs)
+        freqs_complex = torch.polar(torch.ones_like(freqs.float()), freqs.float())
         return torch.view_as_real(x_complex * freqs_complex).flatten(-2).to(x.dtype)
     
     for _ in range(warmup):

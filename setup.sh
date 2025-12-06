@@ -6,13 +6,13 @@ echo "NSA + Optimizer Ablation Study Setup"
 echo "=========================================="
 
 # Create virtual environment if it doesn't exist
-if [ ! -d "venv" ]; then
-    echo "Creating virtual environment..."
-    python -m venv venv
-fi
+#if [ ! -d "venv" ]; then
+#    echo "Creating virtual environment..."
+#    python -m venv venv
+#fi
 
 # Activate environment
-source venv/bin/activate
+#source venv/bin/activate
 
 # Upgrade pip
 pip install --upgrade pip setuptools wheel
@@ -79,7 +79,7 @@ pip install nvidia_cudnn_frontend
 
 # Add Flash-Sparse-Attention to Python path
 export PYTHONPATH="${PYTHONPATH}:$(pwd)/external/Flash-Sparse-Attention"
-echo "export PYTHONPATH=\"\${PYTHONPATH}:$(pwd)/external/Flash-Sparse-Attention\"" >> venv/bin/activate
+#echo "export PYTHONPATH=\"\${PYTHONPATH}:$(pwd)/external/Flash-Sparse-Attention\"" >> venv/bin/activate
 
 # Clone and install NVIDIA Emerging-Optimizers
 echo "Installing NVIDIA Emerging-Optimizers..."

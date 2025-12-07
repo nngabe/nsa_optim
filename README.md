@@ -4,7 +4,7 @@ This repository contains experiments for efficient training of foundation models
 - **Models**: Transformers**, Mamba, Jamba
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
 - **Optimizers**: AdamW, AdamW8bit, SOAP4bit
-- **Model sizes**: 0.6B, 4B, 8B 
+- **Model sizes**: 0.6B, 4B, 8B
 - **Context lengths**: 32K, 64k, 128k
 
   ** Qwen-3 style architecture: RMSNorm, SwiGLU, RoPE, and GQA
@@ -25,18 +25,110 @@ The latest experiment checkpoint can be viewed on Weights & Biases:
 
 ## Installation
 
+### Option 1: Docker Installation (Recommended)
+
+The Docker container provides a complete environment with Ubuntu 24.04, CUDA 13.1, and PyTorch nightly, optimized for Blackwell GPUs.
+
+#### Prerequisites
+- Docker with NVIDIA Container Toolkit installed
+- NVIDIA GPU with driver supporting CUDA 13.1+
+
+#### Build and Run the Container
+
 ```bash
 # Clone this repository
 git clone https://github.com/nngabe/nsa_optim.git
 cd nsa_optim
 
-# Run setup script
-chmod +x scripts/setup.sh
+# Build the Docker image
+docker build -t nsa-optim -f docker/Dockerfile .
+
+# Run the container with GPU support
+docker run --gpus all -it --rm \
+    -v $(pwd)/outputs:/app/outputs \
+    -v $(pwd)/data:/app/data \
+    nsa-optim
+
+# Inside the container, run the setup script to install additional dependencies
+./scripts/setup.sh
+```
+
+#### Quick Start with Docker
+
+```bash
+# Build and run in one command
+docker build -t nsa-optim -f docker/Dockerfile . && \
+docker run --gpus all -it --rm \
+    -v $(pwd)/outputs:/app/outputs \
+    nsa-optim -c "./scripts/setup.sh && python train.py --help"
+```
+
+#### Docker with Persistent Environment
+
+```bash
+# Create a named container for development
+docker run --gpus all -it --name nsa-dev \
+    -v $(pwd):/app \
+    -v nsa-cache:/app/external \
+    nsa-optim
+
+# Inside the container:
 ./scripts/setup.sh
 
-# Activate environment
-source venv/bin/activate
+# Re-attach to the container later
+docker start -ai nsa-dev
 ```
+
+### Option 2: Native Installation
+
+For systems with CUDA already installed:
+
+```bash
+# Clone this repository
+git clone https://github.com/nngabe/nsa_optim.git
+cd nsa_optim
+
+# Run setup script (auto-detects CUDA, Python, and PyTorch versions)
+chmod +x scripts/setup.sh
+./scripts/setup.sh
+```
+
+The setup script automatically:
+- Detects your Python version (requires 3.10+)
+- Detects your CUDA version and selects the appropriate PyTorch build
+- Detects your GPU architecture for optimized kernel compilation
+- Installs PyTorch nightly for CUDA 13.x or stable for older versions
+- Builds and installs all required dependencies
+
+## Environment Details
+
+### Docker Container Specifications
+
+| Component | Version |
+|-----------|---------|
+| Ubuntu | 24.04 LTS |
+| CUDA | 13.1 |
+| cuDNN | 9.x |
+| Python | 3.12 |
+| PyTorch | Nightly (cu131) |
+| Triton | 3.3.0+ |
+
+### Blackwell GPU Optimization
+
+The environment is optimized for NVIDIA Blackwell architecture (GB100/GB200):
+- Compute capability: sm_100/sm_120
+- `TORCH_CUDA_ARCH_LIST="10.0;10.0+PTX;12.0;12.0+PTX"`
+- NCCL optimizations for multi-GPU training
+- Triton kernels compiled for Blackwell
+
+### Included NVIDIA Packages
+
+- **NCCL**: Multi-GPU communication library
+- **cuDNN**: Deep learning primitives
+- **Triton**: JIT compiler for custom GPU kernels
+- **TorchAO**: Quantization and sparsity
+- **Flash Attention**: Memory-efficient attention
+- **Native Sparse Attention**: Hardware-aligned sparse attention
 
 ## Project Structure
 
@@ -80,8 +172,6 @@ Run quick smoke tests to verify your setup:
 ./scripts/smoke_test.sh
 
 # Or run specific tests
-source venv/bin/activate
-
 # Just unit tests
 pytest -v
 
@@ -99,12 +189,12 @@ python train.py \
 ```
 
 The smoke test script tests:
-- ✓ Unit tests (config, model, optimizers)
-- ✓ AdamW with bfloat16 (baseline)
-- ✓ AdamW8bit with bfloat16
-- ✓ Float16 and Float32 precision modes
-- ✓ Gradient checkpointing
-- ✓ SOAP optimizer (if available)
+- Unit tests (config, model, optimizers)
+- AdamW with bfloat16 (baseline)
+- AdamW8bit with bfloat16
+- Float16 and Float32 precision modes
+- Gradient checkpointing
+- SOAP optimizer (if available)
 
 ### Single Experiment
 
@@ -173,7 +263,7 @@ Models follow the Qwen-3 architecture:
 
 ### Attention Mechanisms
 
-**Dense Attention**: Standard multi-head attention with FlashAttention-2 backend. O(n²) complexity.
+**Dense Attention**: Standard multi-head attention with FlashAttention-2 backend. O(n^2) complexity.
 
 **Native Sparse Attention (NSA)**: Hardware-aligned sparse attention combining:
 - Block-level top-k attention selection
@@ -307,7 +397,7 @@ The pipeline requires GitLab runners with GPU support for training jobs. Tag you
 
 ### Scheduled Pipelines
 
-Configure in GitLab CI/CD → Schedules:
+Configure in GitLab CI/CD -> Schedules:
 
 | Schedule | Variable | Frequency |
 |----------|----------|-----------|
@@ -326,7 +416,7 @@ black --check .
 mypy .
 
 # Build Docker image locally
-docker build -t nsa-ablation .
+docker build -t nsa-ablation -f docker/Dockerfile .
 ```
 
 ### Docker Image
@@ -341,3 +431,4 @@ docker pull $CI_REGISTRY_IMAGE:latest
 docker run --gpus all -v $(pwd)/outputs:/app/outputs \
     $CI_REGISTRY_IMAGE:latest \
     python train.py --model_size 0.6B --attention_type nsa
+```

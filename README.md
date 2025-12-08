@@ -54,7 +54,7 @@ nsa_optimizer_ablation/
 
 ## Experiment Grid
 
-The full ablation study covers a select subset for the following configurations:
+The ablation study covers a select subset for the following configurations:
 
 | Dimension | Options |
 |-----------|---------|

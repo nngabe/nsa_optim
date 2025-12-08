@@ -1,13 +1,12 @@
 # Native Sparse Attention + SOAP optimizer Ablation Study
 
 This repository contains experiments for efficient training of foundation models. In particular, we investigate LLM training with the following ablations:
-- **Models**: Transformers**, Mamba, Jamba/Hybrid
+- **Models**: Transformers, Mamba, Jamba/Hybrid
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
 - **Optimizers**: AdamW, AdamW8bit, SOAP4bit
 - **Model sizes**: 0.6B, 4B, 8B 
 - **Context lengths**: 32K, 64k, 128k
 
-  ** Qwen-3 style architecture: RMSNorm, SwiGLU, RoPE, and GQA
 
 ## Overview
 

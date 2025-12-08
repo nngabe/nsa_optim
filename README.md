@@ -11,7 +11,7 @@ This repository contains experiments for efficient training of foundation models
 
 ## Overview
 
-We compare efficient architectures, attention mechanisms, and optimizers for training LLMs. Specifically, we investigate usage of the following compute/parameter efficient methods:
+We compare efficient architectures, attention mechanisms, and optimizers for training LLMs. Specifically, we investigate usage of the following compute/parameter efficient methods and utilities:
 
 - [Native Sparse Attention](https://github.com/fla-org/native-sparse-attention) - Hardware-aligned sparse attention
 - [NVIDIA Emerging-Optimizers](https://github.com/NVIDIA-NeMo/Emerging-Optimizers) - SOAP and Shampoo implementations
@@ -27,7 +27,7 @@ The latest experiment checkpoint can be viewed on Weights & Biases:
 
 1. Run the Docker Container for Blackwell GPUs [Dockerhub](https://hub.docker.com/repository/docker/nickgabriel/blackwell-cuda131/general):
 ```
-docker run --rm -it --gpus all --shm-size=16g nickgabriel/blackwell-cuda131:v1
+docker run --rm -it --gpus all nickgabriel/blackwell-cuda131:v1
 ```
 
 

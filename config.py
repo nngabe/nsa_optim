@@ -1,9 +1,13 @@
 """
 Configuration for NSA + Optimizer Ablation Study
 Training from scratch with different architectures, optimizers, and context lengths
+
+Supports dynamic model sizing - specify any size like "0.5B", "1B", "2.5B", "100M"
 """
+import math
+import re
 from dataclasses import dataclass, field
-from typing import Literal, Optional, List, Dict, Any
+from typing import Literal, Optional, List, Dict, Any, Tuple
 from enum import Enum
 
 
@@ -17,25 +21,26 @@ class MambaType(str, Enum):
     """Mamba architecture types for hybrid models"""
     NONE = "none"           # Pure transformer (no Mamba)
     MAMBA2 = "mamba2"       # Mamba-2 (SSD formulation)
-    MAMBA3 = "mamba3"       # Mamba-3 (trapezoidal discretization)
+    MAMBA3 = "mamba3"       # Used for DeltaNet
 
 
 class OptimizerType(str, Enum):
     ADAMW = "adamw"
-    ADAMW_4BIT = "adamw4bit"  # 4-bit AdamW from lpmm
-    ADAMW_8BIT = "adamw8bit"   # 8-bit AdamW from torchao/lpmm
+    ADAMW_4BIT = "adamw4bit"
+    ADAMW_8BIT = "adamw8bit"
     SOAP = "soap"
-    SOAP_4BIT = "soap4bit"     # SOAP with 4-bit states
-    SOAP_8BIT = "soap8bit"     # SOAP with 8-bit states
+    SOAP_4BIT = "soap4bit"
+    SOAP_8BIT = "soap8bit"
     SHAMPOO = "shampoo"
 
 
+# Keep ModelSize enum for backward compatibility
 class ModelSize(str, Enum):
-    """Model sizes based on Qwen-3 architecture"""
-    SMALL = "0.6B"    # Qwen3-0.6B
-    MEDIUM = "4B"     # Qwen3-4B
-    LARGE = "8B"      # Qwen3-8B
-    XLARGE = "32B"    # Qwen3-32B
+    """Legacy model sizes - prefer using string sizes like '1B', '2.5B'"""
+    SMALL = "0.6B"
+    MEDIUM = "4B"
+    LARGE = "8B"
+    XLARGE = "32B"
 
 
 @dataclass
@@ -53,25 +58,243 @@ class ModelConfig:
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = False
     attention_type: AttentionType = AttentionType.DENSE
-    
+
     # NSA specific configs
     nsa_block_size: int = 64
     nsa_window_size: int = 64
     nsa_num_selected_blocks: int = 16
 
 
-# Qwen-3 architecture configurations
+def parse_model_size(size_str: str) -> int:
+    """
+    Parse model size string to number of parameters.
+
+    Supports formats:
+    - "1B", "1.5B", "0.8B" -> billions
+    - "100M", "500M" -> millions
+    - "1000000000" -> raw number
+
+    Returns:
+        Number of parameters as integer
+    """
+    size_str = size_str.strip().upper()
+
+    # Try to match patterns like "1.5B", "100M", etc.
+    match = re.match(r'^([\d.]+)\s*([BMK]?)$', size_str)
+    if match:
+        value = float(match.group(1))
+        suffix = match.group(2)
+
+        if suffix == 'B':
+            return int(value * 1e9)
+        elif suffix == 'M':
+            return int(value * 1e6)
+        elif suffix == 'K':
+            return int(value * 1e3)
+        else:
+            return int(value)
+
+    # Try raw number
+    try:
+        return int(float(size_str))
+    except ValueError:
+        raise ValueError(f"Cannot parse model size: {size_str}. Use formats like '1B', '500M', '1.5B'")
+
+
+def _round_to_multiple(x: int, multiple: int) -> int:
+    """Round x to nearest multiple"""
+    return ((x + multiple // 2) // multiple) * multiple
+
+
+def _round_up_to_multiple(x: int, multiple: int) -> int:
+    """Round x up to nearest multiple"""
+    return ((x + multiple - 1) // multiple) * multiple
+
+
+def compute_transformer_params(
+    hidden_size: int,
+    num_layers: int,
+    num_kv_heads: int = 8,
+    vocab_size: int = 151936,
+    intermediate_multiplier: float = 8/3,
+) -> int:
+    """
+    Compute total parameters for a transformer model.
+
+    Architecture assumptions:
+    - GQA with fixed num_kv_heads
+    - SwiGLU MLP with intermediate_size = hidden_size * intermediate_multiplier
+    - head_dim = 64
+    - Untied embeddings (input + output)
+    """
+    head_dim = 64
+    num_heads = hidden_size // head_dim
+    intermediate_size = _round_up_to_multiple(int(hidden_size * intermediate_multiplier), 64)
+
+    # Embeddings (input + output, untied)
+    embed_params = 2 * vocab_size * hidden_size
+
+    # Per layer params
+    # Attention: Q, K, V, O projections
+    q_params = hidden_size * hidden_size  # Q: hidden -> num_heads * head_dim
+    k_params = hidden_size * (num_kv_heads * head_dim)  # K: hidden -> num_kv_heads * head_dim
+    v_params = hidden_size * (num_kv_heads * head_dim)  # V: hidden -> num_kv_heads * head_dim
+    o_params = hidden_size * hidden_size  # O: num_heads * head_dim -> hidden
+
+    # MLP: gate, up, down (SwiGLU)
+    mlp_params = 3 * hidden_size * intermediate_size
+
+    # Layer norms (2 per layer)
+    ln_params = 2 * hidden_size
+
+    layer_params = q_params + k_params + v_params + o_params + mlp_params + ln_params
+
+    # Final layer norm
+    final_ln_params = hidden_size
+
+    total = embed_params + (num_layers * layer_params) + final_ln_params
+    return total
+
+
+def compute_model_dimensions(
+    target_params: int,
+    vocab_size: int = 151936,
+    num_kv_heads: int = 8,
+    head_dim: int = 64,
+    intermediate_multiplier: float = 8/3,
+    min_layers: int = 4,
+    max_layers: int = 128,
+) -> Tuple[int, int, int, int, int]:
+    """
+    Compute model dimensions to achieve target parameter count.
+
+    Returns:
+        (hidden_size, num_layers, num_heads, num_kv_heads, intermediate_size)
+
+    Strategy:
+    1. For very small models (<500M), use fewer layers with smaller hidden
+    2. For medium models (500M-5B), balance depth and width
+    3. For large models (>5B), favor depth over width
+
+    Constraints:
+    - hidden_size must be divisible by head_dim (64)
+    - num_heads = hidden_size / head_dim
+    - intermediate_size = round(hidden_size * 8/3) to nearest 64
+    """
+    # Estimate embedding overhead
+    # For a reasonable hidden_size, embeddings are roughly 2 * vocab * hidden
+    # This is a significant portion for small models
+
+    # Use binary search to find good hidden_size/num_layers combo
+    best_config = None
+    best_diff = float('inf')
+
+    # Determine layer range based on target size
+    if target_params < 500_000_000:  # < 500M
+        layer_range = range(min_layers, min(32, max_layers + 1), 2)
+    elif target_params < 5_000_000_000:  # 500M - 5B
+        layer_range = range(12, min(48, max_layers + 1), 2)
+    else:  # > 5B
+        layer_range = range(24, max_layers + 1, 4)
+
+    for num_layers in layer_range:
+        # Binary search for hidden_size
+        low_hidden = 256
+        high_hidden = 16384
+
+        while low_hidden <= high_hidden:
+            mid_hidden = _round_to_multiple((low_hidden + high_hidden) // 2, head_dim)
+
+            # Ensure minimum hidden size
+            if mid_hidden < 256:
+                mid_hidden = 256
+
+            params = compute_transformer_params(
+                mid_hidden, num_layers, num_kv_heads, vocab_size, intermediate_multiplier
+            )
+
+            diff = abs(params - target_params)
+
+            if diff < best_diff:
+                best_diff = diff
+                num_heads = mid_hidden // head_dim
+                intermediate_size = _round_up_to_multiple(
+                    int(mid_hidden * intermediate_multiplier), 64
+                )
+                best_config = (mid_hidden, num_layers, num_heads, num_kv_heads, intermediate_size)
+
+            if params < target_params:
+                low_hidden = mid_hidden + head_dim
+            else:
+                high_hidden = mid_hidden - head_dim
+
+    if best_config is None:
+        raise ValueError(f"Could not find valid configuration for {target_params} parameters")
+
+    return best_config
+
+
+def get_model_config_for_size(
+    size_str: str,
+    attention_type: AttentionType = AttentionType.DENSE,
+    max_position_embeddings: int = 32768,
+    vocab_size: int = 151936,
+) -> ModelConfig:
+    """
+    Get model configuration for a given size string.
+
+    Args:
+        size_str: Model size like "1B", "2.5B", "500M"
+        attention_type: Type of attention mechanism
+        max_position_embeddings: Maximum sequence length
+        vocab_size: Vocabulary size
+
+    Returns:
+        ModelConfig with computed dimensions
+    """
+    target_params = parse_model_size(size_str)
+
+    hidden_size, num_layers, num_heads, num_kv_heads, intermediate_size = compute_model_dimensions(
+        target_params, vocab_size=vocab_size
+    )
+
+    # Compute actual params for the name
+    actual_params = compute_transformer_params(
+        hidden_size, num_layers, num_kv_heads, vocab_size
+    )
+
+    # Format actual params for name
+    if actual_params >= 1e9:
+        param_str = f"{actual_params/1e9:.2f}B"
+    else:
+        param_str = f"{actual_params/1e6:.0f}M"
+
+    return ModelConfig(
+        name=f"transformer-{param_str}",
+        hidden_size=hidden_size,
+        num_hidden_layers=num_layers,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        intermediate_size=intermediate_size,
+        vocab_size=vocab_size,
+        max_position_embeddings=max_position_embeddings,
+        attention_type=attention_type,
+        nsa_num_selected_blocks=min(16, max_position_embeddings // 64),
+    )
+
+
+# Legacy MODEL_CONFIGS for backward compatibility
 MODEL_CONFIGS: Dict[ModelSize, ModelConfig] = {
     ModelSize.SMALL: ModelConfig(
-        name="qwen3-0.6B",
+        name="transformer-0.6B",
         hidden_size=1024,
         num_hidden_layers=28,
         num_attention_heads=16,
-        num_key_value_heads=8,  # GQA
+        num_key_value_heads=8,
         intermediate_size=3072,
     ),
     ModelSize.MEDIUM: ModelConfig(
-        name="qwen3-4B",
+        name="transformer-4B",
         hidden_size=2560,
         num_hidden_layers=36,
         num_attention_heads=32,
@@ -79,7 +302,7 @@ MODEL_CONFIGS: Dict[ModelSize, ModelConfig] = {
         intermediate_size=9216,
     ),
     ModelSize.LARGE: ModelConfig(
-        name="qwen3-8B",
+        name="transformer-8B",
         hidden_size=4096,
         num_hidden_layers=36,
         num_attention_heads=32,
@@ -87,7 +310,7 @@ MODEL_CONFIGS: Dict[ModelSize, ModelConfig] = {
         intermediate_size=12288,
     ),
     ModelSize.XLARGE: ModelConfig(
-        name="qwen3-32B",
+        name="transformer-32B",
         hidden_size=5120,
         num_hidden_layers=64,
         num_attention_heads=40,
@@ -106,37 +329,35 @@ class OptimizerConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
-    
+
     # SOAP/Shampoo specific
     precondition_frequency: int = 10
     shampoo_beta: float = 0.95
-    max_precond_dim: int = 1024  # Reduced from 8192 to save memory (8x less memory per factor)
+    max_precond_dim: int = 1024
 
-    # Low-bit optimizer specific (for SOAP_LOWBIT)
+    # Low-bit optimizer specific
     use_4bit: bool = True
     use_8bit: bool = False
 
-    # Shampoo optimizer state precision (for distributed_shampoo)
-    # Options: "float32", "bfloat16", "float16"
-    # Using bfloat16 can reduce memory by 2x with minimal accuracy loss
+    # Shampoo optimizer state precision
     shampoo_state_dtype: str = "bfloat16"
 
 
 @dataclass
 class TrainingConfig:
     """Configuration for training"""
-    # Model
-    model_size: ModelSize = ModelSize.SMALL
+    # Model - now accepts string like "1B", "2.5B", "500M"
+    model_size: str = "0.6B"
     attention_type: AttentionType = AttentionType.DENSE
 
     # Mamba/Jamba configuration
-    mamba_type: MambaType = MambaType.NONE  # None = pure transformer, mamba2/mamba3 = pure mamba or Jamba hybrid
-    jamba_ratio: int = 7  # Ratio of mamba:attention blocks (7:1 by default, only used when both mamba_type and attn_type are set)
+    mamba_type: MambaType = MambaType.NONE
+    jamba_ratio: int = 7
 
     # Optimizer
     optimizer_type: OptimizerType = OptimizerType.ADAMW
     optimizer_config: Optional[OptimizerConfig] = None
-    
+
     # Training params
     max_seq_length: int = 32768
     batch_size: int = 1
@@ -144,78 +365,76 @@ class TrainingConfig:
     num_train_steps: int = 100000
     warmup_steps: int = 2000
     max_grad_norm: float = 1.0
-    
+
     # Learning rate schedule
     lr_scheduler_type: str = "cosine"
     min_lr_ratio: float = 0.1
-    
+
     # Precision
     dtype: str = "bfloat16"
     use_flash_attention: bool = True
     gradient_checkpointing: bool = True
-    
+
     # Distributed
     tensor_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     data_parallel_size: int = 1
-    
+
     # Logging
     log_interval: int = 10
     eval_interval: int = 1000
     save_interval: int = 5000
-    
+
     # Data
     dataset_name: str = "HuggingFaceFW/fineweb-edu"
     dataset_subset: str = "sample-10BT"
-    
+
     # Paths
     output_dir: str = "./outputs"
     run_name: str = ""
-    
+
     def __post_init__(self):
+        # Convert ModelSize enum to string if needed
+        if isinstance(self.model_size, ModelSize):
+            self.model_size = self.model_size.value
+
         if self.optimizer_config is None:
             self.optimizer_config = OptimizerConfig(optimizer_type=self.optimizer_type)
 
         if not self.run_name:
             # Build architecture name based on mamba_type and attention_type
             if self.mamba_type != MambaType.NONE and self.attention_type != AttentionType.DENSE:
-                # Jamba hybrid
                 arch_name = f"jamba_{self.mamba_type.value}_{self.attention_type.value}"
             elif self.mamba_type != MambaType.NONE:
-                # Pure Mamba
                 arch_name = self.mamba_type.value
             else:
-                # Pure Transformer
                 arch_name = self.attention_type.value
-            self.run_name = f"{self.model_size.value}_{arch_name}_{self.optimizer_type.value}_ctx{self.max_seq_length}"
+            self.run_name = f"{self.model_size}_{arch_name}_{self.optimizer_type.value}_ctx{self.max_seq_length}"
 
 
 # Context length configurations
 CONTEXT_LENGTHS = {
-    "standard": [32768, 131072],  # 32k, 128k for all models
-    "extended_nsa": [524288, 1048576],  # 512k, 1M for NSA only
+    "standard": [32768, 131072],
+    "extended_nsa": [524288, 1048576],
 }
 
 
 def get_experiment_grid() -> List[TrainingConfig]:
     """Generate all experiment configurations"""
     experiments = []
-    
-    for model_size in ModelSize:
+    model_sizes = ["0.6B", "4B", "8B", "32B"]
+
+    for model_size in model_sizes:
         for attention_type in AttentionType:
             for optimizer_type in OptimizerType:
-                # Determine context lengths based on attention type
                 context_lengths = CONTEXT_LENGTHS["standard"].copy()
                 if attention_type == AttentionType.NSA:
                     context_lengths.extend(CONTEXT_LENGTHS["extended_nsa"])
-                
+
                 for ctx_len in context_lengths:
-                    # Adjust batch size based on model size and context length
                     batch_size, grad_accum = _get_batch_config(model_size, ctx_len)
-                    
-                    # Adjust training steps for fair comparison
                     train_steps = _get_training_steps(model_size, ctx_len)
-                    
+
                     config = TrainingConfig(
                         model_size=model_size,
                         attention_type=attention_type,
@@ -226,39 +445,43 @@ def get_experiment_grid() -> List[TrainingConfig]:
                         num_train_steps=train_steps,
                     )
                     experiments.append(config)
-    
+
     return experiments
 
 
-def _get_batch_config(model_size: ModelSize, ctx_len: int) -> tuple:
+def _get_batch_config(model_size: str, ctx_len: int) -> tuple:
     """Get batch size and gradient accumulation based on model and context"""
-    # Base configurations (assuming 8x80GB GPUs)
-    configs = {
-        ModelSize.SMALL: {32768: (4, 4), 131072: (1, 16), 524288: (1, 32), 1048576: (1, 64)},
-        ModelSize.MEDIUM: {32768: (2, 8), 131072: (1, 16), 524288: (1, 32), 1048576: (1, 64)},
-        ModelSize.LARGE: {32768: (1, 16), 131072: (1, 32), 524288: (1, 64), 1048576: (1, 128)},
-        ModelSize.XLARGE: {32768: (1, 32), 131072: (1, 64), 524288: (1, 128), 1048576: (1, 256)},
-    }
-    return configs[model_size].get(ctx_len, (1, 16))
+    params = parse_model_size(model_size)
+
+    # Scale based on parameter count
+    if params < 1e9:  # < 1B
+        base = {32768: (4, 4), 131072: (1, 16), 524288: (1, 32), 1048576: (1, 64)}
+    elif params < 5e9:  # 1B - 5B
+        base = {32768: (2, 8), 131072: (1, 16), 524288: (1, 32), 1048576: (1, 64)}
+    elif params < 15e9:  # 5B - 15B
+        base = {32768: (1, 16), 131072: (1, 32), 524288: (1, 64), 1048576: (1, 128)}
+    else:  # > 15B
+        base = {32768: (1, 32), 131072: (1, 64), 524288: (1, 128), 1048576: (1, 256)}
+
+    return base.get(ctx_len, (1, 16))
 
 
-def _get_training_steps(model_size: ModelSize, ctx_len: int) -> int:
+def _get_training_steps(model_size: str, ctx_len: int) -> int:
     """Adjust training steps to keep similar token count"""
     base_steps = 100000
     base_ctx = 32768
-    # Fewer steps for longer context to maintain similar compute
     return max(10000, int(base_steps * base_ctx / ctx_len))
 
 
 def get_filtered_experiments(
-    model_sizes: Optional[List[ModelSize]] = None,
+    model_sizes: Optional[List[str]] = None,
     attention_types: Optional[List[AttentionType]] = None,
     optimizer_types: Optional[List[OptimizerType]] = None,
     context_lengths: Optional[List[int]] = None,
 ) -> List[TrainingConfig]:
     """Get filtered subset of experiments"""
     all_experiments = get_experiment_grid()
-    
+
     filtered = []
     for exp in all_experiments:
         if model_sizes and exp.model_size not in model_sizes:
@@ -270,5 +493,35 @@ def get_filtered_experiments(
         if context_lengths and exp.max_seq_length not in context_lengths:
             continue
         filtered.append(exp)
-    
+
     return filtered
+
+
+def print_model_config(size_str: str):
+    """Print model configuration for a given size (useful for debugging)"""
+    config = get_model_config_for_size(size_str)
+    actual_params = compute_transformer_params(
+        config.hidden_size,
+        config.num_hidden_layers,
+        config.num_key_value_heads,
+        config.vocab_size,
+    )
+
+    print(f"Model Configuration for '{size_str}':")
+    print(f"  Name: {config.name}")
+    print(f"  Hidden size: {config.hidden_size}")
+    print(f"  Num layers: {config.num_hidden_layers}")
+    print(f"  Num attention heads: {config.num_attention_heads}")
+    print(f"  Num KV heads: {config.num_key_value_heads}")
+    print(f"  Head dim: {config.hidden_size // config.num_attention_heads}")
+    print(f"  Intermediate size: {config.intermediate_size}")
+    print(f"  Vocab size: {config.vocab_size}")
+    print(f"  Actual parameters: {actual_params:,} ({actual_params/1e9:.3f}B)")
+
+
+if __name__ == "__main__":
+    # Test various model sizes
+    test_sizes = ["100M", "500M", "0.8B", "1B", "1.5B", "2B", "3B", "7B", "13B", "30B", "70B"]
+    for size in test_sizes:
+        print_model_config(size)
+        print()

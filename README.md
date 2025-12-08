@@ -1,4 +1,4 @@
-# Native Sparse Attention + SOAP optimizer Ablation Study
+# SSM + Sparse Attention + SOAP optimizer Ablation Study
 
 This repository contains experiments for efficient training of foundation models. In particular, we investigate LLM training with the following ablations:
 - **Models**: Transformers, Mamba, Jamba/Hybrid

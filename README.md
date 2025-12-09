@@ -39,21 +39,25 @@ docker run -rm -it --gpus all nvcr.io/nvidia/pytorch:24.04-py3
 
 ```
 nsa_optimizer_ablation/
-├── config.py              # Configuration classes and experiment grid
-├── model.py               # Model architecture (Dense & NSA attention)
-├── optimizers.py          # Optimizer implementations (AdamW, AdamW8bit, SOAP, Shampoo)
+├── config.py              # Configuration classes, enums, and experiment grid
+├── optimizers.py          # Optimizer implementations (AdamW, SOAP, Shampoo, low-bit variants)
 ├── data.py                # Data loading and tokenization
-├── train.py               # Main training script
-├── run_experiments.py     # Experiment runner and job generation
-├── requirements.txt       # Python dependencies
-├── README.md              # This file
-├── mamba/                 # Mamba architecture implementations
-├── profiling/             # Memory profiling utilities
+├── train.py               # Main training script with FSDP/DDP support
+├── run_experiments.py     # Experiment runner and SLURM/bash job generation
+├── models/                # Model architectures
+│   ├── __init__.py        # Package exports
+│   ├── transformer.py     # Transformer with Dense/NSA/FSA attention
+│   ├── mamba.py           # Mamba2 state space model
+│   ├── deltanet.py        # Gated Delta Net linear attention
+│   ├── hybrid.py          # Hybrid model (interleaved Mamba/DeltaNet/Attention)
+│   └── configs.py         # Model config factory functions
+├── profiling/             # Memory and compute profiling utilities
+├── analysis/              # Result analysis and evaluation utilities
 ├── tests/                 # Unit tests
 ├── scripts/               # Shell scripts (setup.sh, smoke_test.sh)
-├── docker/                # Dockerfile for containerization
-├── configs/               # Configuration files (lpmm_config.txt)
-└── analysis/              # Analysis and evaluation utilities
+├── configs/               # Configuration files
+├── requirements.txt       # Python dependencies
+└── README.md              # This file
 ```
 
 ## Experiment Grid

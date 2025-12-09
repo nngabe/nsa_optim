@@ -82,10 +82,10 @@ Run quick smoke tests to verify your setup:
 # Or run specific tests
 source venv/bin/activate
 
-# Just unit tests
+# Run unit tests
 pytest -v
 
-# Just a quick training smoke test
+# Or just a quick training smoke test
 python train.py \
     --model_size 0.6B \
     --attention_type dense \

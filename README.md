@@ -38,12 +38,11 @@ docker run -rm -it --gpus all nvcr.io/nvidia/pytorch:24.04-py3
 ## Project Structure
 
 ```
-nsa_optimizer_ablation/
+nsa_optim/
 ├── config.py              # Configuration classes, enums, and experiment grid
 ├── optimizers.py          # Optimizer implementations (AdamW, SOAP, Shampoo, low-bit variants)
 ├── data.py                # Data loading and tokenization
 ├── train.py               # Main training script with FSDP/DDP support
-├── run_experiments.py     # Experiment runner and SLURM/bash job generation
 ├── models/                # Model architectures
 │   ├── __init__.py        # Package exports
 │   ├── transformer.py     # Transformer with Dense/NSA/FSA attention

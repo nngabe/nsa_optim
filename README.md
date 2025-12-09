@@ -4,7 +4,7 @@ This repository contains experiments for efficient training of foundation models
 - **Models**: Transformers, Mamba, Jamba/Hybrid
 - **Attention mechanisms**: Dense attention vs Native Sparse Attention (NSA)
 - **Optimizers**: AdamW, AdamW8bit, SOAP4bit
-- **Model sizes**: 0.6B, 4B, 8B 
+- **Model sizes**: 100M-4B 
 - **Context lengths**: 32K, 64k, 128k
 
 

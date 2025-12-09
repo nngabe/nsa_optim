@@ -110,19 +110,19 @@ test:model:
     - python -c "
       import torch
       from config import MODEL_CONFIGS, ModelSize, AttentionType
-      from model import create_model
-      
+      from models import create_model
+
       # Test small model creation
       config = MODEL_CONFIGS[ModelSize.SMALL]
       config.max_position_embeddings = 2048
-      
+
       # Test dense attention
       config.attention_type = AttentionType.DENSE
       model = create_model(config)
       x = torch.randint(0, 1000, (1, 128))
       out, loss, _ = model(x, labels=x)
       print(f'Dense model output shape: {out.shape}, loss: {loss.item():.4f}')
-      
+
       # Test NSA attention
       config.attention_type = AttentionType.NSA
       model = create_model(config)

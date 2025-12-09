@@ -367,7 +367,7 @@ def evaluate_model(
     """Evaluate a trained model checkpoint"""
     from transformers import AutoTokenizer
     from datasets import load_dataset
-    from model import TransformerModel
+    from models import TransformerModel
     from config import ModelConfig, MODEL_CONFIGS
     
     checkpoint_path = Path(checkpoint_path)

@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from config import ModelConfig, AttentionType, MODEL_CONFIGS, ModelSize
-from model import (
+from models import (
     RMSNorm,
     RotaryEmbedding,
     DenseAttention,

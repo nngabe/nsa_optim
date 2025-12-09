@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity, record_function
 
 from config import TrainingConfig, ModelConfig, ModelSize, AttentionType, OptimizerType, OptimizerConfig, MODEL_CONFIGS
-from model import create_model
+from models import create_model
 from data import DataConfig, create_dataloader, get_tokenizer
 
 

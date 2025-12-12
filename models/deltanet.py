@@ -14,7 +14,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from fla.layers import GatedDeltaNet
+# Workaround for fla library conflict with transformers
+# The fla library tries to register 'bitnet' with AutoConfig/AutoModel/AutoModelForCausalLM
+# but transformers already has these registered
+def _import_fla_with_patch():
+    """Import fla.layers while patching transformers auto-registration to allow overwrites."""
+    try:
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+        from transformers.models.auto.modeling_auto import (
+            MODEL_MAPPING,
+            MODEL_FOR_CAUSAL_LM_MAPPING,
+        )
+
+        # Save original register methods
+        originals = {
+            'config': CONFIG_MAPPING.register,
+            'model': MODEL_MAPPING.register,
+            'causal_lm': MODEL_FOR_CAUSAL_LM_MAPPING.register,
+        }
+
+        # Patch to allow exist_ok=True
+        CONFIG_MAPPING.register = lambda k, v, exist_ok=False: originals['config'](k, v, exist_ok=True)
+        MODEL_MAPPING.register = lambda k, v, exist_ok=False: originals['model'](k, v, exist_ok=True)
+        MODEL_FOR_CAUSAL_LM_MAPPING.register = lambda k, v, exist_ok=False: originals['causal_lm'](k, v, exist_ok=True)
+
+        from fla.layers import GatedDeltaNet
+
+        # Restore original methods
+        CONFIG_MAPPING.register = originals['config']
+        MODEL_MAPPING.register = originals['model']
+        MODEL_FOR_CAUSAL_LM_MAPPING.register = originals['causal_lm']
+
+        return GatedDeltaNet
+    except (ImportError, AttributeError):
+        # Fallback if transformers structure changes
+        from fla.layers import GatedDeltaNet
+        return GatedDeltaNet
+
+GatedDeltaNet = _import_fla_with_patch()
 
 
 @dataclass

@@ -51,6 +51,7 @@ from models.hybrid import (
     AttentionBlock,
     create_hybrid_model,
     get_block_classes_from_pattern,
+    print_hybrid_model_modules,
 )
 
 from models.configs import (
@@ -99,6 +100,7 @@ __all__ = [
     "AttentionBlock",
     "create_hybrid_model",
     "get_block_classes_from_pattern",
+    "print_hybrid_model_modules",
     # Config functions
     "get_model_config",
     "get_mamba2_config",

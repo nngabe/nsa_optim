@@ -25,12 +25,20 @@ from models.deltanet import GatedDeltaNetConfig
 from models.hybrid import HybridConfig
 
 
-def get_model_config(training_config: TrainingConfig) -> ModelConfig:
+def get_model_config(
+    training_config: TrainingConfig,
+    nsa_block_size: int = 64,
+    nsa_window_size: int = 64,
+    nsa_num_selected_blocks: int = 16,
+) -> ModelConfig:
     """Get model configuration based on training config, computing dimensions dynamically"""
     return get_model_config_for_size(
         training_config.model_size,
         attention_type=training_config.attention_type,
         max_position_embeddings=training_config.max_seq_length,
+        nsa_block_size=nsa_block_size,
+        nsa_window_size=nsa_window_size,
+        nsa_num_selected_blocks=nsa_num_selected_blocks,
     )
 
 
@@ -84,8 +92,45 @@ def get_deltanet_config(training_config: TrainingConfig) -> GatedDeltaNetConfig:
     )
 
 
-def get_hybrid_config(training_config: TrainingConfig, block_pattern: str, block_repeats: int) -> HybridConfig:
+def compute_block_repeats(block_pattern: str, model_size: str) -> int:
+    """
+    Compute appropriate block_repeats based on model size.
+
+    Strategy:
+    - Target a reasonable number of layers based on model size
+    - Use compute_model_dimensions to get the layer count a transformer would use
+    - Divide by pattern length to get block repeats
+
+    Returns:
+        Number of block repeats
+    """
+    target_params = parse_model_size(model_size)
+    pattern_len = len(block_pattern)
+
+    # Use compute_model_dimensions to get the standard layer count for this size
+    _, computed_layers, _, _, _ = compute_model_dimensions(target_params)
+
+    # Compute repeats, ensuring at least 1
+    block_repeats = max(1, computed_layers // pattern_len)
+
+    return block_repeats
+
+
+def get_hybrid_config(
+    training_config: TrainingConfig,
+    block_pattern: str,
+    block_repeats: int,
+    mamba_d_state: int = 128,
+    mamba_d_conv: int = 4,
+    mamba_expand: int = 2,
+    mamba_headdim: int = 64,
+) -> HybridConfig:
     """Get Hybrid model configuration based on training config and pattern, computing dimensions dynamically"""
+    # Auto-compute block_repeats if -1
+    if block_repeats == -1:
+        block_repeats = compute_block_repeats(block_pattern, training_config.model_size)
+        print(f"Auto-computed block_repeats={block_repeats} for pattern '{block_pattern}' at size {training_config.model_size}")
+
     # Compute dimensions for target size
     target_params = parse_model_size(training_config.model_size)
     vocab_size = 151936
@@ -102,8 +147,10 @@ def get_hybrid_config(training_config: TrainingConfig, block_pattern: str, block
         vocab_size=vocab_size,
         block_pattern=block_pattern,
         block_repeats=block_repeats,
-        mamba_d_state=128,
-        mamba_headdim=64,
+        mamba_d_state=mamba_d_state,
+        mamba_d_conv=mamba_d_conv,
+        mamba_expand=mamba_expand,
+        mamba_headdim=mamba_headdim,
         deltanet_head_dim=64,
         num_attention_heads=num_heads,
         num_key_value_heads=num_kv_heads,

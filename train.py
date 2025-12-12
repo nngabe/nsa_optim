@@ -19,6 +19,14 @@ from typing import Optional, Dict, Any, Tuple
 from contextlib import nullcontext
 from functools import partial
 
+import warnings
+
+# Suppress the specific warning about kernel overrides
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning
+)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,7 +55,7 @@ from models import (
     Mamba2Model, Mamba2Config, Mamba2Block, create_mamba2,
     GatedDeltaNetModel, GatedDeltaNetConfig, GatedDeltaNetBlock, create_gated_deltanet,
     HybridModel, HybridConfig, MambaBlock, DeltaNetBlock, AttentionBlock,
-    create_hybrid_model, get_block_classes_from_pattern,
+    create_hybrid_model, get_block_classes_from_pattern, print_hybrid_model_modules,
     get_model_config, get_mamba2_config, get_deltanet_config, get_hybrid_config, get_model_type,
 )
 from optimizers import create_optimizer, get_lr_scheduler
@@ -85,6 +93,13 @@ def setup_model(
     block_pattern: Optional[str] = None,
     block_repeats: int = 1,
     kernel_type: str = "liger",
+    mamba_d_state: int = 128,
+    mamba_d_conv: int = 4,
+    mamba_expand: int = 2,
+    mamba_headdim: int = 64,
+    nsa_block_size: int = 64,
+    nsa_window_size: int = 64,
+    nsa_num_selected_blocks: int = 16,
 ) -> Tuple[nn.Module, str]:
     """Setup model with optional distributed wrapping.
 
@@ -95,7 +110,13 @@ def setup_model(
     model_type = get_model_type(training_config, block_pattern)
 
     if model_type == "hybrid":
-        hybrid_config = get_hybrid_config(training_config, block_pattern, block_repeats)
+        hybrid_config = get_hybrid_config(
+            training_config, block_pattern, block_repeats,
+            mamba_d_state=mamba_d_state,
+            mamba_d_conv=mamba_d_conv,
+            mamba_expand=mamba_expand,
+            mamba_headdim=mamba_headdim,
+        )
         model = create_hybrid_model(hybrid_config)
         block_cls = get_block_classes_from_pattern(block_pattern)
     elif model_type == "mamba2":
@@ -107,7 +128,12 @@ def setup_model(
         model = create_gated_deltanet(deltanet_config)
         block_cls = {GatedDeltaNetBlock}
     else:  # transformer
-        model_config = get_model_config(training_config)
+        model_config = get_model_config(
+            training_config,
+            nsa_block_size=nsa_block_size,
+            nsa_window_size=nsa_window_size,
+            nsa_num_selected_blocks=nsa_num_selected_blocks,
+        )
         model = create_model(model_config, kernel_type=kernel_type)
         block_cls = {TransformerBlock}
 
@@ -349,6 +375,13 @@ def train(
     block_pattern: Optional[str] = None,
     block_repeats: int = 1,
     kernel_type: str = "liger",
+    mamba_d_state: int = 128,
+    mamba_d_conv: int = 4,
+    mamba_expand: int = 2,
+    mamba_headdim: int = 64,
+    nsa_block_size: int = 64,
+    nsa_window_size: int = 64,
+    nsa_num_selected_blocks: int = 16,
 ):
     """Main training function"""
     # Setup distributed
@@ -395,13 +428,26 @@ def train(
                   f"with {config.attention_type.value} (kernel={kernel_type})")
 
     model, model_type = setup_model(
-        config, rank, world_size, block_pattern, block_repeats, kernel_type
+        config, rank, world_size, block_pattern, block_repeats, kernel_type,
+        mamba_d_state=mamba_d_state,
+        mamba_d_conv=mamba_d_conv,
+        mamba_expand=mamba_expand,
+        mamba_headdim=mamba_headdim,
+        nsa_block_size=nsa_block_size,
+        nsa_window_size=nsa_window_size,
+        nsa_num_selected_blocks=nsa_num_selected_blocks,
     )
 
     # Count parameters
     num_params = sum(p.numel() for p in model.parameters())
     if is_main:
         print(f"Model parameters: {num_params / 1e9:.2f}B")
+
+    # Print model structure for specific hybrid patterns
+    if is_main and model_type == "hybrid" and block_pattern in ("MMM", "DDD", "AAA", "MMDMMA"):
+        model_to_print = model.module if isinstance(model, (DDP, FSDP)) else model
+        actual_block_repeats = model_to_print.config.block_repeats
+        print_hybrid_model_modules(model_to_print, block_pattern, actual_block_repeats)
 
     # Setup optimizer
     optimizer_config = config.optimizer_config or OptimizerConfig(
@@ -458,6 +504,7 @@ def train(
         print(f"Context length: {config.max_seq_length}")
 
     data_iter = iter(train_dataloader)
+
     step = start_step
     grad_accum_step = 0
     running_loss = 0.0
@@ -490,7 +537,8 @@ def train(
             # Logging
             if step % config.log_interval == 0 and is_main:
                 elapsed = time.time() - start_time
-                avg_loss = running_loss / config.log_interval
+                # Divide by number of batches (log_interval * gradient_accumulation_steps)
+                avg_loss = running_loss / (config.log_interval * config.gradient_accumulation_steps)
                 tokens_per_sec = (
                     config.batch_size * config.max_seq_length *
                     config.log_interval * world_size
@@ -547,7 +595,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train models for ablation study")
 
     # Architecture selection
-    parser.add_argument("--mamba_type", type=str, default="none",
+    parser.add_argument("--mamba_type", type=str, default="mamba2",
                        choices=["none", "mamba2", "deltanet"],
                        help="Model type: none (transformer), mamba2, or deltanet")
     parser.add_argument("-attn", "--attn_type", type=str, default="dense",
@@ -557,8 +605,26 @@ def parse_args():
     # Hybrid model support
     parser.add_argument("--block_pattern", type=str, default=None,
                        help="Block pattern for hybrid models, e.g., 'MMDMMA' where M=Mamba, D=DeltaNet, A=Attention")
-    parser.add_argument("--block_repeats", type=int, default=1,
-                       help="Number of times to repeat the block pattern")
+    parser.add_argument("--block_repeats", type=int, default=-1,
+                       help="Number of times to repeat the block pattern (-1 for auto based on model size)")
+
+    # Mamba2 parameters
+    parser.add_argument("--mamba_d_state", type=int, default=128,
+                       help="Mamba state dimension (d_state)")
+    parser.add_argument("--mamba_d_conv", type=int, default=4,
+                       help="Mamba convolution dimension (d_conv)")
+    parser.add_argument("--mamba_expand", type=int, default=2,
+                       help="Mamba expansion factor")
+    parser.add_argument("--mamba_headdim", type=int, default=64,
+                       help="Mamba head dimension")
+
+    # NSA (Native Sparse Attention) parameters
+    parser.add_argument("--nsa_block_size", type=int, default=64,
+                       help="NSA block size for sparse attention")
+    parser.add_argument("--nsa_window_size", type=int, default=64,
+                       help="NSA window size for local attention")
+    parser.add_argument("--nsa_num_selected_blocks", type=int, default=16,
+                       help="NSA number of top-k blocks to attend to")
 
     # Kernel type
     parser.add_argument("--kernel_type", type=str, default="liger",
@@ -566,7 +632,7 @@ def parse_args():
                        help="Kernel implementation type for transformer")
 
     # Experiment selection
-    parser.add_argument("--model_size", type=str, default="0.6B",
+    parser.add_argument("--model_size", type=str, default="0.44B",
                        help="Model size (e.g., '0.6B', '1B', '2.5B', '500M')")
     parser.add_argument("--optimizer_type", type=str, default="adamw",
                        choices=["adamw", "adamw4bit", "adamw8bit", "soap", "soap4bit", "soap8bit", "shampoo"])
@@ -677,6 +743,13 @@ def main():
         block_pattern=args.block_pattern,
         block_repeats=args.block_repeats,
         kernel_type=args.kernel_type,
+        mamba_d_state=args.mamba_d_state,
+        mamba_d_conv=args.mamba_d_conv,
+        mamba_expand=args.mamba_expand,
+        mamba_headdim=args.mamba_headdim,
+        nsa_block_size=args.nsa_block_size,
+        nsa_window_size=args.nsa_window_size,
+        nsa_num_selected_blocks=args.nsa_num_selected_blocks,
     )
 
 

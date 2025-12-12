@@ -111,6 +111,21 @@ def _round_up_to_multiple(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
 
+def _nearest_power_of_2(x: int) -> int:
+    """Find nearest power of 2 to x"""
+    if x <= 0:
+        return 1
+    lower = 1 << (x.bit_length() - 1)
+    upper = lower << 1
+    if x - lower < upper - x:
+        return lower
+    return upper
+
+
+# Valid power-of-2 hidden sizes for model dimensions
+VALID_HIDDEN_SIZES = [256, 512, 1024, 2048, 4096, 8192, 16384]
+
+
 def compute_transformer_params(
     hidden_size: int,
     num_layers: int,
@@ -171,21 +186,11 @@ def compute_model_dimensions(
     Returns:
         (hidden_size, num_layers, num_heads, num_kv_heads, intermediate_size)
 
-    Strategy:
-    1. For very small models (<500M), use fewer layers with smaller hidden
-    2. For medium models (500M-5B), balance depth and width
-    3. For large models (>5B), favor depth over width
-
     Constraints:
-    - hidden_size must be divisible by head_dim (64)
+    - hidden_size MUST be a power of 2 (for Triton kernel optimization)
     - num_heads = hidden_size / head_dim
-    - intermediate_size = round(hidden_size * 8/3) to nearest 64
+    - intermediate_size = round(hidden_size * 8/3) to nearest power of 2
     """
-    # Estimate embedding overhead
-    # For a reasonable hidden_size, embeddings are roughly 2 * vocab * hidden
-    # This is a significant portion for small models
-
-    # Use binary search to find good hidden_size/num_layers combo
     best_config = None
     best_diff = float('inf')
 
@@ -197,36 +202,22 @@ def compute_model_dimensions(
     else:  # > 5B
         layer_range = range(24, max_layers + 1, 4)
 
-    for num_layers in layer_range:
-        # Binary search for hidden_size
-        low_hidden = 256
-        high_hidden = 16384
-
-        while low_hidden <= high_hidden:
-            mid_hidden = _round_to_multiple((low_hidden + high_hidden) // 2, head_dim)
-
-            # Ensure minimum hidden size
-            if mid_hidden < 256:
-                mid_hidden = 256
-
+    # Only use power-of-2 hidden sizes for Triton optimization
+    for hidden_size in VALID_HIDDEN_SIZES:
+        for num_layers in layer_range:
             params = compute_transformer_params(
-                mid_hidden, num_layers, num_kv_heads, vocab_size, intermediate_multiplier
+                hidden_size, num_layers, num_kv_heads, vocab_size, intermediate_multiplier
             )
 
             diff = abs(params - target_params)
 
             if diff < best_diff:
                 best_diff = diff
-                num_heads = mid_hidden // head_dim
-                intermediate_size = _round_up_to_multiple(
-                    int(mid_hidden * intermediate_multiplier), 64
-                )
-                best_config = (mid_hidden, num_layers, num_heads, num_kv_heads, intermediate_size)
-
-            if params < target_params:
-                low_hidden = mid_hidden + head_dim
-            else:
-                high_hidden = mid_hidden - head_dim
+                num_heads = hidden_size // head_dim
+                # Round intermediate_size to nearest power of 2 for Triton
+                raw_intermediate = int(hidden_size * intermediate_multiplier)
+                intermediate_size = _nearest_power_of_2(raw_intermediate)
+                best_config = (hidden_size, num_layers, num_heads, num_kv_heads, intermediate_size)
 
     if best_config is None:
         raise ValueError(f"Could not find valid configuration for {target_params} parameters")
@@ -239,6 +230,9 @@ def get_model_config_for_size(
     attention_type: AttentionType = AttentionType.DENSE,
     max_position_embeddings: int = 32768,
     vocab_size: int = 151936,
+    nsa_block_size: int = 64,
+    nsa_window_size: int = 64,
+    nsa_num_selected_blocks: int = 16,
 ) -> ModelConfig:
     """
     Get model configuration for a given size string.
@@ -248,6 +242,9 @@ def get_model_config_for_size(
         attention_type: Type of attention mechanism
         max_position_embeddings: Maximum sequence length
         vocab_size: Vocabulary size
+        nsa_block_size: Block size for NSA
+        nsa_window_size: Window size for NSA
+        nsa_num_selected_blocks: Number of top-k blocks for NSA
 
     Returns:
         ModelConfig with computed dimensions
@@ -279,7 +276,9 @@ def get_model_config_for_size(
         vocab_size=vocab_size,
         max_position_embeddings=max_position_embeddings,
         attention_type=attention_type,
-        nsa_num_selected_blocks=min(16, max_position_embeddings // 64),
+        nsa_block_size=nsa_block_size,
+        nsa_window_size=nsa_window_size,
+        nsa_num_selected_blocks=nsa_num_selected_blocks,
     )
 
 

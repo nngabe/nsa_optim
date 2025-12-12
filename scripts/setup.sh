@@ -10,11 +10,11 @@ echo "=========================================="
 #    echo "Creating virtual environment..."
 #    python -m venv venv
 #fi
-
+pip install flash-linear-attention
 pip install transformers datasets tokenizers bitsandbytes
 pip install accelerate wandb einops peft fairscale yacs
 
-
+mkdir external
 # Clone and install Native Sparse Attention
 echo "Installing Native Sparse Attention..."
 if [ ! -d "external/native-sparse-attention" ]; then

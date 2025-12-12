@@ -58,7 +58,7 @@ from models import (
     create_hybrid_model, get_block_classes_from_pattern, print_hybrid_model_modules,
     get_model_config, get_mamba2_config, get_deltanet_config, get_hybrid_config, get_model_type,
 )
-from optimizers import create_optimizer, get_lr_scheduler
+from optimizers import create_optimizer, get_lr_scheduler, print_preconditioning_stats
 from data import DataConfig, create_dataloader, get_tokenizer
 
 
@@ -93,6 +93,7 @@ def setup_model(
     block_pattern: Optional[str] = None,
     block_repeats: int = 1,
     kernel_type: str = "liger",
+    ce_kernel_type: Optional[str] = None,
     mamba_d_state: int = 128,
     mamba_d_conv: int = 4,
     mamba_expand: int = 2,
@@ -145,6 +146,12 @@ def setup_model(
     dtype = getattr(torch, training_config.dtype)
     print(f'model dtype: {dtype}')
     model = model.to(dtype)
+
+    # Override cross-entropy loss kernel if specified
+    if ce_kernel_type is not None and hasattr(model, 'lm_head'):
+        from models.kernels import create_cross_entropy_loss
+        model.loss_fn = create_cross_entropy_loss(model.lm_head, kernel_type=ce_kernel_type)
+        print(f'CE kernel type: {ce_kernel_type}')
 
     # Gradient checkpointing
     if training_config.gradient_checkpointing:
@@ -375,6 +382,7 @@ def train(
     block_pattern: Optional[str] = None,
     block_repeats: int = 1,
     kernel_type: str = "liger",
+    ce_kernel_type: Optional[str] = None,
     mamba_d_state: int = 128,
     mamba_d_conv: int = 4,
     mamba_expand: int = 2,
@@ -429,6 +437,7 @@ def train(
 
     model, model_type = setup_model(
         config, rank, world_size, block_pattern, block_repeats, kernel_type,
+        ce_kernel_type=ce_kernel_type,
         mamba_d_state=mamba_d_state,
         mamba_d_conv=mamba_d_conv,
         mamba_expand=mamba_expand,
@@ -458,6 +467,10 @@ def train(
     # Unwrap model for optimizer
     model_for_opt = model.module if isinstance(model, (DDP, FSDP)) else model
     optimizer = create_optimizer(model_for_opt, optimizer_config, world_size)
+
+    # Print preconditioning coverage for SOAP/Shampoo optimizers
+    if is_main:
+        print_preconditioning_stats(model_for_opt, optimizer_config)
 
     # Setup scheduler
     scheduler = get_lr_scheduler(
@@ -596,8 +609,8 @@ def parse_args():
 
     # Architecture selection
     parser.add_argument("--mamba_type", type=str, default="mamba2",
-                       choices=["none", "mamba2", "deltanet"],
-                       help="Model type: none (transformer), mamba2, or deltanet")
+                       choices=["none", "mamba2"],
+                       help="Model type: none, mamba2")
     parser.add_argument("-attn", "--attn_type", type=str, default="dense",
                        choices=["dense", "native_sparse_attention", "nsa", "flash_sparse_attention", "fsa"],
                        help="Attention type for transformer models")
@@ -630,12 +643,15 @@ def parse_args():
     parser.add_argument("--kernel_type", type=str, default="liger",
                        choices=["baseline", "triton", "liger"],
                        help="Kernel implementation type for transformer")
+    parser.add_argument("--ce_kernel_type", type=str, default=None,
+                       choices=["baseline", "liger"],
+                       help="Cross-entropy kernel type (overrides loss_fn for hybrid/mamba/deltanet models)")
 
     # Experiment selection
     parser.add_argument("--model_size", type=str, default="0.44B",
                        help="Model size (e.g., '0.6B', '1B', '2.5B', '500M')")
     parser.add_argument("--optimizer_type", type=str, default="adamw",
-                       choices=["adamw", "adamw4bit", "adamw8bit", "soap", "soap4bit", "soap8bit", "shampoo"])
+                       choices=["adamw", "adamw4bit", "adamw8bit", "soap4bit", "soap8bit", "shampoo"])
     parser.add_argument("--context_length", type=int, default=8192,
                        choices=[8192, 32768, 65536, 131072, 524288, 1048576])
 
@@ -647,6 +663,14 @@ def parse_args():
     parser.add_argument("-lr","--learning_rate", type=float, default=1e-4)
     parser.add_argument("-wd","--weight_decay", type=float, default=0.1)
     parser.add_argument("-clip","--max_grad_norm", type=float, default=1.0)
+
+    # SOAP/Shampoo optimizer parameters
+    parser.add_argument("--precondition_frequency", type=int, default=5,
+                       help="Preconditioning frequency for SOAP/Shampoo optimizers")
+    parser.add_argument("--shampoo_beta", type=float, default=0.95,
+                       help="EMA coefficient for Kronecker factors in SOAP/Shampoo")
+    parser.add_argument("--max_precond_dim", type=int, default=8192,
+                       help="Maximum dimension for preconditioning in SOAP/Shampoo")
 
     # Precision
     parser.add_argument("--dtype", type=str, default="bfloat16",
@@ -697,6 +721,9 @@ def main():
         optimizer_type=optimizer_type,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        precondition_frequency=args.precondition_frequency,
+        shampoo_beta=args.shampoo_beta,
+        max_precond_dim=args.max_precond_dim,
     )
 
     # Create training config
@@ -743,6 +770,7 @@ def main():
         block_pattern=args.block_pattern,
         block_repeats=args.block_repeats,
         kernel_type=args.kernel_type,
+        ce_kernel_type=args.ce_kernel_type,
         mamba_d_state=args.mamba_d_state,
         mamba_d_conv=args.mamba_d_conv,
         mamba_expand=args.mamba_expand,

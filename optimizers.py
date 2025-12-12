@@ -333,9 +333,9 @@ class SOAPReference(Optimizer):
                     state["step"] = 0
                     state["exp_avg"] = torch.zeros_like(p)
                     state["exp_avg_sq"] = torch.zeros_like(p)
-                    
-                    # Initialize Kronecker factors for 2D+ params
-                    if grad.ndim >= 2 and all(d <= max_dim for d in grad.shape):
+
+                    # Initialize Kronecker factors for 2D params (weight matrices)
+                    if grad.ndim == 2 and all(d <= max_dim for d in grad.shape):
                         state["L"] = torch.zeros(grad.shape[0], grad.shape[0], device=grad.device, dtype=torch.float32)
                         state["R"] = torch.zeros(grad.shape[-1], grad.shape[-1], device=grad.device, dtype=torch.float32)
                         state["QL"] = torch.eye(grad.shape[0], device=grad.device, dtype=torch.float32)
@@ -782,15 +782,43 @@ class SOAPLowBit(Optimizer):
                     state["exp_avg"] = torch.zeros_like(p)
                     state["exp_avg_sq"] = torch.zeros_like(p)
 
-                    if grad.ndim >= 2 and all(d <= max_dim for d in grad.shape):
-                        # Kronecker factors in fp32
-                        state["L"] = torch.zeros(grad.shape[0], grad.shape[0], device=grad.device, dtype=torch.float32)
-                        state["R"] = torch.zeros(grad.shape[-1], grad.shape[-1], device=grad.device, dtype=torch.float32)
-                        # Eigenbasis: start with identity, will be quantized after first update
-                        state["QL"] = torch.eye(grad.shape[0], device=grad.device, dtype=torch.float32)
-                        state["QR"] = torch.eye(grad.shape[-1], device=grad.device, dtype=torch.float32)
-                        state["QL_q"] = None  # (quantized, scale, zp, orig_cols)
-                        state["QR_q"] = None
+                    # Precondition 2D parameters with block diagonal approximation
+                    if grad.ndim == 2:
+                        m, n = grad.shape
+
+                        # Compute number of blocks needed for each dimension
+                        num_blocks_row = (m + max_dim - 1) // max_dim  # ceil division
+                        num_blocks_col = (n + max_dim - 1) // max_dim
+
+                        # Store block structure info
+                        state["num_blocks_row"] = num_blocks_row
+                        state["num_blocks_col"] = num_blocks_col
+                        state["block_size"] = max_dim
+
+                        # Initialize only eigenbases for each block (quantized)
+                        # Kronecker factors L/R are accumulated only during eigenbasis updates
+                        state["QL_q_blocks"] = []
+                        state["QR_q_blocks"] = []
+                        state["block_shapes"] = []  # Store block dimensions
+
+                        for i in range(num_blocks_row):
+                            row_start = i * max_dim
+                            row_end = min((i + 1) * max_dim, m)
+                            block_m = row_end - row_start
+
+                            for j in range(num_blocks_col):
+                                col_start = j * max_dim
+                                col_end = min((j + 1) * max_dim, n)
+                                block_n = col_end - col_start
+
+                                # Eigenbasis for this block (identity initially, will be quantized)
+                                QL_block = torch.eye(block_m, device=grad.device, dtype=torch.float32)
+                                QR_block = torch.eye(block_n, device=grad.device, dtype=torch.float32)
+
+                                # Immediately quantize to save memory
+                                state["QL_q_blocks"].append(self._quantize_block(QL_block))
+                                state["QR_q_blocks"].append(self._quantize_block(QR_block))
+                                state["block_shapes"].append((block_m, block_n))
 
                 state["step"] += 1
 
@@ -800,37 +828,75 @@ class SOAPLowBit(Optimizer):
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
 
-                use_precond = grad.ndim >= 2 and "L" in state
+                use_precond = grad.ndim == 2 and "L_blocks" in state
 
                 if use_precond:
-                    L, R = state["L"], state["R"]
-
-                    # Dequantize eigenbasis if quantized
-                    if state["QL_q"] is not None:
-                        QL = self._dequantize_block(*state["QL_q"])
-                        QR = self._dequantize_block(*state["QR_q"])
-                    else:
-                        QL, QR = state["QL"], state["QR"]
-
-                    # Update Kronecker factors
                     grad_float = grad.float()
-                    if grad.ndim == 2:
-                        L.mul_(shampoo_beta).add_(grad_float @ grad_float.T, alpha=1 - shampoo_beta)
-                        R.mul_(shampoo_beta).add_(grad_float.T @ grad_float, alpha=1 - shampoo_beta)
+                    m, n = grad.shape
+                    max_dim = state["block_size"]
+                    num_blocks_row = state["num_blocks_row"]
+                    num_blocks_col = state["num_blocks_col"]
 
-                    # Periodic eigenbasis update with block quantization
-                    if state["step"] % precond_freq == 0:
-                        QL_new = torch.linalg.qr(L @ QL)[0]
-                        QR_new = torch.linalg.qr(R @ QR)[0]
+                    # Process each block
+                    grad_preconditioned = torch.zeros_like(grad_float)
+                    needs_eigenbasis_update = (state["step"] % precond_freq == 0)
 
-                        # Block quantize eigenbasis
-                        state["QL_q"] = self._quantize_block(QL_new)
-                        state["QR_q"] = self._quantize_block(QR_new)
+                    # Temporary storage for Kronecker factors (only if updating eigenbasis)
+                    if needs_eigenbasis_update:
+                        L_accum = {}
+                        R_accum = {}
 
-                        QL, QR = QL_new, QR_new
+                    for i in range(num_blocks_row):
+                        row_start = i * max_dim
+                        row_end = min((i + 1) * max_dim, m)
 
-                    grad_proj = QL.T @ grad_float @ QR
-                    grad = grad_proj.to(grad.dtype)
+                        for j in range(num_blocks_col):
+                            col_start = j * max_dim
+                            col_end = min((j + 1) * max_dim, n)
+
+                            block_idx = i * num_blocks_col + j
+                            grad_block = grad_float[row_start:row_end, col_start:col_end]
+                            block_m, block_n = state["block_shapes"][block_idx]
+
+                            # Dequantize eigenbasis
+                            QL_block = self._dequantize_block(*state["QL_q_blocks"][block_idx])
+                            QR_block = self._dequantize_block(*state["QR_q_blocks"][block_idx])
+
+                            # Accumulate Kronecker factors if we're updating eigenbasis
+                            if needs_eigenbasis_update:
+                                if block_idx not in L_accum:
+                                    L_accum[block_idx] = torch.zeros(
+                                        block_m, block_m, device=grad.device, dtype=torch.float32
+                                    )
+                                    R_accum[block_idx] = torch.zeros(
+                                        block_n, block_n, device=grad.device, dtype=torch.float32
+                                    )
+
+                                L_accum[block_idx].add_(grad_block @ grad_block.T)
+                                R_accum[block_idx].add_(grad_block.T @ grad_block)
+
+                            # Precondition this block
+                            grad_block_precond = QL_block.T @ grad_block @ QR_block
+                            grad_preconditioned[row_start:row_end, col_start:col_end] = grad_block_precond
+
+                    # Update eigenbases if needed
+                    if needs_eigenbasis_update:
+                        for block_idx in range(num_blocks_row * num_blocks_col):
+                            QL_block = self._dequantize_block(*state["QL_q_blocks"][block_idx])
+                            QR_block = self._dequantize_block(*state["QR_q_blocks"][block_idx])
+
+                            # Update eigenbasis using accumulated Kronecker factors
+                            L_block = L_accum[block_idx]
+                            R_block = R_accum[block_idx]
+
+                            QL_new = torch.linalg.qr(L_block @ QL_block)[0]
+                            QR_new = torch.linalg.qr(R_block @ QR_block)[0]
+
+                            # Quantize and store
+                            state["QL_q_blocks"][block_idx] = self._quantize_block(QL_new)
+                            state["QR_q_blocks"][block_idx] = self._quantize_block(QR_new)
+
+                    grad = grad_preconditioned.to(grad.dtype)
 
                 # Adam update
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
@@ -845,12 +911,35 @@ class SOAPLowBit(Optimizer):
                 update = exp_avg / denom
 
                 if use_precond:
-                    if state["QL_q"] is not None:
-                        QL = self._dequantize_block(*state["QL_q"])
-                        QR = self._dequantize_block(*state["QR_q"])
-                    update = QL @ update.float() @ QR.T
-                    update = update.to(p.dtype)
-                
+                    # Apply block diagonal preconditioner to update
+                    update_float = update.float()
+                    update_preconditioned = torch.zeros_like(update_float)
+
+                    for i in range(num_blocks_row):
+                        row_start = i * max_dim
+                        row_end = min((i + 1) * max_dim, m)
+
+                        for j in range(num_blocks_col):
+                            col_start = j * max_dim
+                            col_end = min((j + 1) * max_dim, n)
+
+                            block_idx = i * num_blocks_col + j
+                            update_block = update_float[row_start:row_end, col_start:col_end]
+
+                            # Dequantize eigenbasis for this block
+                            if state["QL_q_blocks"][block_idx] is not None:
+                                QL_block = self._dequantize_block(*state["QL_q_blocks"][block_idx])
+                                QR_block = self._dequantize_block(*state["QR_q_blocks"][block_idx])
+                            else:
+                                QL_block = state["QL_blocks"][block_idx]
+                                QR_block = state["QR_blocks"][block_idx]
+
+                            # Apply preconditioner to this block
+                            update_block_precond = QL_block @ update_block @ QR_block.T
+                            update_preconditioned[row_start:row_end, col_start:col_end] = update_block_precond
+
+                    update = update_preconditioned.to(p.dtype)
+
                 p.add_(update, alpha=-step_size)
         
         return loss
@@ -893,3 +982,153 @@ def get_lr_scheduler(
     
     else:
         raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+
+def analyze_preconditioning_coverage(
+    model: nn.Module,
+    optimizer_config: OptimizerConfig,
+) -> Dict[str, Any]:
+    """
+    Analyze what percentage of parameters will be preconditioned in SOAP/Shampoo.
+
+    Parameters are preconditioned if:
+    - They are 2D (weight matrices)
+    - Both dimensions are <= max_precond_dim
+    - They require gradients
+
+    Args:
+        model: The model to analyze
+        optimizer_config: Optimizer configuration
+
+    Returns:
+        Dictionary with statistics about preconditioning coverage
+    """
+    max_dim = optimizer_config.max_precond_dim
+    optimizer_type = optimizer_config.optimizer_type
+
+    # Only analyze for SOAP/Shampoo optimizers
+    is_soap_or_shampoo = optimizer_type in [
+        OptimizerType.SOAP,
+        OptimizerType.SOAP_4BIT,
+        OptimizerType.SOAP_8BIT,
+        OptimizerType.SHAMPOO,
+    ]
+
+    if not is_soap_or_shampoo:
+        return {
+            "optimizer_type": optimizer_type.value,
+            "uses_preconditioning": False,
+        }
+
+    total_params = 0
+    preconditioned_params = 0
+
+    total_2d_params = 0
+    preconditioned_2d_params = 0
+
+    param_details = {
+        "preconditioned": [],
+        "not_preconditioned_too_large": [],
+        "not_preconditioned_1d": [],
+    }
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        num_params = param.numel()
+        total_params += num_params
+
+        # Check if this parameter will be preconditioned
+        # With block diagonal, ALL 2D parameters get preconditioned
+        if param.ndim == 2:
+            total_2d_params += num_params
+            preconditioned_params += num_params
+            preconditioned_2d_params += num_params
+
+            # Determine number of blocks needed
+            m, n = param.shape
+            num_blocks_row = (m + max_dim - 1) // max_dim
+            num_blocks_col = (n + max_dim - 1) // max_dim
+            num_blocks = num_blocks_row * num_blocks_col
+
+            param_details["preconditioned"].append({
+                "name": name,
+                "shape": tuple(param.shape),
+                "num_params": num_params,
+                "num_blocks": num_blocks,
+            })
+        elif param.ndim > 2:
+            # 3D+ parameters not preconditioned (e.g., Conv1d kernels)
+            param_details["not_preconditioned_too_large"].append({
+                "name": name,
+                "shape": tuple(param.shape),
+                "num_params": num_params,
+            })
+        else:
+            param_details["not_preconditioned_1d"].append({
+                "name": name,
+                "shape": tuple(param.shape),
+                "num_params": num_params,
+            })
+
+    precond_pct = (preconditioned_params / total_params * 100) if total_params > 0 else 0.0
+    precond_2d_pct = (preconditioned_2d_params / total_2d_params * 100) if total_2d_params > 0 else 0.0
+
+    return {
+        "optimizer_type": optimizer_type.value,
+        "uses_preconditioning": True,
+        "max_precond_dim": max_dim,
+        "total_params": total_params,
+        "preconditioned_params": preconditioned_params,
+        "preconditioned_percentage": precond_pct,
+        "total_2d_params": total_2d_params,
+        "preconditioned_2d_params": preconditioned_2d_params,
+        "preconditioned_2d_percentage": precond_2d_pct,
+        "num_preconditioned": len(param_details["preconditioned"]),
+        "num_too_large": len(param_details["not_preconditioned_too_large"]),
+        "num_1d": len(param_details["not_preconditioned_1d"]),
+        "details": param_details,
+    }
+
+
+def print_preconditioning_stats(model: nn.Module, optimizer_config: OptimizerConfig):
+    """
+    Print statistics about which parameters will be preconditioned.
+
+    Args:
+        model: The model to analyze
+        optimizer_config: Optimizer configuration
+    """
+    stats = analyze_preconditioning_coverage(model, optimizer_config)
+
+    if not stats["uses_preconditioning"]:
+        return
+
+    print('\n')
+    print(f"Max preconditioner dimension: {stats['max_precond_dim']} (block diagonal)")
+    print(f"  Total trainable parameters: {stats['total_params']:,}")
+    print(f"  Preconditioned parameters:  {stats['preconditioned_params']:,} ({stats['preconditioned_percentage']:.1f}%)")
+
+    # Count total blocks across all layers
+    total_blocks = sum(item.get("num_blocks", 1) for item in stats['details']['preconditioned'])
+    print(f"  Total preconditioner blocks: {total_blocks}")
+
+    # Show largest layers that are now preconditioned with blocks
+    large_preconditioned = [
+        item for item in stats['details']['preconditioned']
+        if item.get("num_blocks", 1) > 1
+    ]
+
+    if large_preconditioned:
+        large_preconditioned_sorted = sorted(
+            large_preconditioned,
+            key=lambda x: x["num_params"],
+            reverse=True
+        )[:5]
+
+        print(f"\n  Large layers preconditioned with block diagonal:")
+        for item in large_preconditioned_sorted:
+            print(f"    {item['name']:<50} {str(item['shape']):<20} {item['num_blocks']:>2} blocks")
+
+    print()

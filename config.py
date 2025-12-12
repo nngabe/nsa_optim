@@ -330,7 +330,7 @@ class OptimizerConfig:
     eps: float = 1e-8
 
     # SOAP/Shampoo specific
-    precondition_frequency: int = 10
+    precondition_frequency: int = 5
     shampoo_beta: float = 0.95
     max_precond_dim: int = 1024
 

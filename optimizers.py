@@ -529,10 +529,16 @@ class ShampooReference(Optimizer):
 
 # Check for torchao quantization support
 try:
-    from torchao.quantization import quantize_affine, dequantize_affine
+    from torchao.quantization import (
+        quantize_affine,
+        dequantize_affine,
+        choose_qparams_affine,
+        MappingType,
+    )
     TORCHAO_QUANT_AVAILABLE = True
 except ImportError:
     TORCHAO_QUANT_AVAILABLE = False
+    MappingType = None
 
 # Check for gemlite packing support
 try:
@@ -544,13 +550,20 @@ except ImportError:
 
 class SOAPLowBit(Optimizer):
     """
-    SOAP optimizer with low-bit (4-bit) quantized states
-    Quantizes Kronecker factors and Adam states for memory efficiency.
+    SOAP optimizer with low-bit (4-bit or 8-bit) quantized eigenbasis states.
+    Uses sub-row block quantization (default 64) for 4-bit stability.
 
-    Supports optimized backends:
-    - torchao: For efficient quantize/dequantize operations
-    - gemlite: For efficient 4-bit packing/unpacking
-    - fallback: Pure PyTorch implementation
+    Args:
+        params: Parameters to optimize
+        lr: Learning rate
+        betas: Adam beta coefficients
+        shampoo_beta: EMA coefficient for Kronecker factors
+        eps: Numerical stability constant
+        weight_decay: Decoupled weight decay
+        precondition_frequency: Steps between eigenbasis updates
+        max_precond_dim: Max dimension for preconditioning
+        bits: Quantization bits (4 or 8)
+        q_block_size: Sub-row block size for quantization (default 64)
     """
     def __init__(
         self,
@@ -563,6 +576,7 @@ class SOAPLowBit(Optimizer):
         precondition_frequency: int = 10,
         max_precond_dim: int = 8192,
         bits: int = 4,
+        q_block_size: int = 32,
         use_optimized: bool = True,
     ):
         defaults = dict(
@@ -579,119 +593,164 @@ class SOAPLowBit(Optimizer):
 
         self._step = 0
         self.bits = bits
-        self.use_optimized = use_optimized and (TORCHAO_QUANT_AVAILABLE or GEMLITE_PACK_AVAILABLE)
+        self.q_block_size = q_block_size
+        self.use_torchao = use_optimized and TORCHAO_QUANT_AVAILABLE
 
-        if self.use_optimized:
-            backends = []
-            if TORCHAO_QUANT_AVAILABLE:
-                backends.append("torchao")
-            if GEMLITE_PACK_AVAILABLE:
-                backends.append("gemlite")
-            print(f"SOAPLowBit using optimized backends: {', '.join(backends)}")
+        if self.use_torchao:
+            print(f"SOAPLowBit: {bits}-bit, block_size={q_block_size} (torchao)")
         else:
-            print("SOAPLowBit using fallback (pure PyTorch) implementation")
+            print(f"SOAPLowBit: {bits}-bit, block_size={q_block_size} (fallback)")
 
-    def _quantize(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """Quantize tensor to low-bit representation.
+    def _quantize_block(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """Sub-row block quantization for stability.
+
+        For a 2D tensor [rows, cols], quantizes in blocks of [1, q_block_size].
+        Each block gets its own scale/zero_point.
 
         Returns:
-            (quantized_tensor, scale, zero_point)
-
-        Note: Currently uses fallback implementation as it's faster for our use case.
-        torchao implementation is kept for reference/future optimization.
+            (quantized, scales, zero_points)
+            scales/zp shape: [rows, num_blocks] where num_blocks = ceil(cols / q_block_size)
         """
-        # Use fallback - currently faster than torchao for simple per-tensor quantization
-        return self._quantize_fallback(tensor)
+        if tensor.ndim != 2:
+            return self._quantize_per_tensor(tensor)
 
-    def _quantize_torchao(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """Quantize using torchao's affine quantization"""
+        if self.use_torchao:
+            return self._quantize_block_torchao(tensor)
+        return self._quantize_block_fallback(tensor)
+
+    def _quantize_block_torchao(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """Block quantization using torchao."""
         quant_min = 0
         quant_max = 2**self.bits - 1
+        rows, cols = tensor.shape
 
-        # Compute scale and zero_point for affine quantization
-        min_val = tensor.min()
-        max_val = tensor.max()
-        scale = (max_val - min_val) / (quant_max - quant_min)
-        if scale == 0:
-            scale = torch.tensor(1.0, device=tensor.device, dtype=tensor.dtype)
+        # Pad to multiple of block size
+        padded_cols = ((cols + self.q_block_size - 1) // self.q_block_size) * self.q_block_size
+        if padded_cols != cols:
+            tensor_padded = torch.zeros(rows, padded_cols, device=tensor.device, dtype=tensor.dtype)
+            tensor_padded[:, :cols] = tensor
         else:
-            scale = scale.to(tensor.dtype)
-        zero_point = (-min_val / scale).round().clamp(quant_min, quant_max).to(torch.int64)
+            tensor_padded = tensor
 
-        # Use torchao quantize_affine
-        block_size = tensor.shape  # per-tensor quantization
-        quantized = quantize_affine(
-            tensor,
+        # Block size: (1, q_block_size) means sub-row blocks
+        block_size = (1, self.q_block_size)
+
+        scale, zero_point = choose_qparams_affine(
+            tensor_padded,
+            mapping_type=MappingType.ASYMMETRIC,
             block_size=block_size,
-            scale=scale.view(1),
-            zero_point=zero_point.view(1),
+            target_dtype=torch.uint8,
+            quant_min=quant_min,
+            quant_max=quant_max,
+            scale_dtype=tensor.dtype,
+            zero_point_dtype=torch.float32,
+        )
+
+        quantized = quantize_affine(
+            tensor_padded,
+            block_size=block_size,
+            scale=scale,
+            zero_point=zero_point.to(torch.int32),
             output_dtype=torch.uint8,
             quant_min=quant_min,
             quant_max=quant_max,
         )
-        return quantized, scale, zero_point.float()
 
-    def _quantize_fallback(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """Fallback quantization using pure PyTorch"""
-        min_val = tensor.min()
-        max_val = tensor.max()
-        scale = (max_val - min_val) / (2**self.bits - 1)
+        # Store original cols for dequantization
+        return quantized, scale, zero_point, cols
 
-        if scale == 0:
-            scale = torch.tensor(1.0, device=tensor.device, dtype=tensor.dtype)
+    def _quantize_block_fallback(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor, int]:
+        """Sub-row block quantization fallback (pure PyTorch)."""
+        quant_max = 2**self.bits - 1
+        rows, cols = tensor.shape
+        bs = self.q_block_size
 
+        # Pad to multiple of block size
+        padded_cols = ((cols + bs - 1) // bs) * bs
+        num_blocks = padded_cols // bs
+
+        if padded_cols != cols:
+            tensor_padded = torch.zeros(rows, padded_cols, device=tensor.device, dtype=tensor.dtype)
+            tensor_padded[:, :cols] = tensor
+        else:
+            tensor_padded = tensor
+
+        # Reshape to [rows, num_blocks, block_size]
+        tensor_blocks = tensor_padded.view(rows, num_blocks, bs)
+
+        # Per-block min/max
+        min_val = tensor_blocks.min(dim=2, keepdim=True)[0]  # [rows, num_blocks, 1]
+        max_val = tensor_blocks.max(dim=2, keepdim=True)[0]
+
+        scale = (max_val - min_val) / quant_max
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
         zero_point = (-min_val / scale).round()
-        quantized = ((tensor / scale) + zero_point).round().clamp(0, 2**self.bits - 1).to(torch.uint8)
-        return quantized, scale, zero_point
 
-    def _dequantize(self, quantized: Tensor, scale: Tensor, zero_point: Tensor) -> Tensor:
-        """Dequantize tensor back to float.
+        quantized_blocks = ((tensor_blocks / scale) + zero_point).round().clamp(0, quant_max).to(torch.uint8)
+        quantized = quantized_blocks.view(rows, padded_cols)
+
+        return quantized, scale.squeeze(2), zero_point.squeeze(2), cols
+
+    def _dequantize_block(self, quantized: Tensor, scale: Tensor, zero_point: Tensor, orig_cols: int) -> Tensor:
+        """Dequantize block-quantized tensor.
 
         Args:
-            quantized: Quantized tensor (uint8)
-            scale: Scale factor
-            zero_point: Zero point offset
-
-        Note: Currently uses fallback implementation as it's faster for our use case.
-        torchao implementation is kept for reference/future optimization.
+            quantized: uint8 tensor [rows, padded_cols]
+            scale: Per-block scales [rows, num_blocks]
+            zero_point: Per-block zero points [rows, num_blocks]
+            orig_cols: Original number of columns before padding
         """
-        # Use fallback - currently faster than torchao for simple per-tensor dequantization
-        return self._dequantize_fallback(quantized, scale, zero_point)
+        # Per-tensor case: orig_cols is None
+        if orig_cols is None:
+            return self._dequantize_per_tensor(quantized, scale, zero_point)
 
-    def _dequantize_torchao(self, quantized: Tensor, scale: Tensor, zero_point: Tensor) -> Tensor:
-        """Dequantize using torchao's affine dequantization"""
-        block_size = quantized.shape
-        return dequantize_affine(
+        if self.use_torchao:
+            return self._dequantize_block_torchao(quantized, scale, zero_point, orig_cols)
+        return self._dequantize_block_fallback(quantized, scale, zero_point, orig_cols)
+
+    def _dequantize_block_torchao(self, quantized: Tensor, scale: Tensor, zero_point: Tensor, orig_cols: int) -> Tensor:
+        """Dequantize using torchao."""
+        block_size = (1, self.q_block_size)
+        dequantized = dequantize_affine(
             quantized,
             block_size=block_size,
-            scale=scale.view(1) if scale.ndim == 0 else scale,
-            zero_point=zero_point.view(1).to(torch.int64) if zero_point.ndim == 0 else zero_point.to(torch.int64),
+            scale=scale,
+            zero_point=zero_point.to(torch.int32),
             input_dtype=torch.uint8,
             quant_min=0,
             quant_max=2**self.bits - 1,
             output_dtype=torch.float32,
         )
+        return dequantized[:, :orig_cols]
 
-    def _dequantize_fallback(self, quantized: Tensor, scale: Tensor, zero_point: Tensor) -> Tensor:
-        """Fallback dequantization using pure PyTorch"""
+    def _dequantize_block_fallback(self, quantized: Tensor, scale: Tensor, zero_point: Tensor, orig_cols: int) -> Tensor:
+        """Dequantize sub-row blocks (fallback)."""
+        rows, padded_cols = quantized.shape
+        bs = self.q_block_size
+        num_blocks = padded_cols // bs
+
+        # Reshape to blocks
+        quantized_blocks = quantized.view(rows, num_blocks, bs).float()
+        # scale, zero_point: [rows, num_blocks] -> [rows, num_blocks, 1]
+        dequant_blocks = (quantized_blocks - zero_point.unsqueeze(2)) * scale.unsqueeze(2)
+        dequantized = dequant_blocks.view(rows, padded_cols)
+        return dequantized[:, :orig_cols]
+
+    def _quantize_per_tensor(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor, None]:
+        """Per-tensor quantization for 1D tensors."""
+        quant_max = 2**self.bits - 1
+        min_val = tensor.min()
+        max_val = tensor.max()
+        scale = (max_val - min_val) / quant_max
+        if scale == 0:
+            scale = torch.tensor(1.0, device=tensor.device, dtype=tensor.dtype)
+        zero_point = (-min_val / scale).round()
+        quantized = ((tensor / scale) + zero_point).round().clamp(0, quant_max).to(torch.uint8)
+        return quantized, scale, zero_point, None
+
+    def _dequantize_per_tensor(self, quantized: Tensor, scale: Tensor, zero_point: Tensor) -> Tensor:
+        """Per-tensor dequantization."""
         return (quantized.float() - zero_point) * scale
-
-    def _matmul(self, a: Tensor, b: Tensor) -> Tensor:
-        """Optimized matrix multiplication.
-
-        Uses torch.compile or standard matmul based on availability.
-        """
-        if self.use_optimized:
-            return self._matmul_optimized(a, b)
-        return self._matmul_fallback(a, b)
-
-    def _matmul_optimized(self, a: Tensor, b: Tensor) -> Tensor:
-        """Optimized matmul - uses torch's optimized paths"""
-        return torch.matmul(a, b)
-
-    def _matmul_fallback(self, a: Tensor, b: Tensor) -> Tensor:
-        """Fallback matmul using @ operator"""
-        return a @ b
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
@@ -699,9 +758,9 @@ class SOAPLowBit(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        
+
         self._step += 1
-        
+
         for group in self.param_groups:
             beta1, beta2 = group["betas"]
             shampoo_beta = group["shampoo_beta"]
@@ -710,89 +769,85 @@ class SOAPLowBit(Optimizer):
             weight_decay = group["weight_decay"]
             precond_freq = group["precondition_frequency"]
             max_dim = group["max_precond_dim"]
-            
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                
+
                 grad = p.grad
                 state = self.state[p]
-                
+
                 if len(state) == 0:
                     state["step"] = 0
-                    # Store momentum in full precision for stability
                     state["exp_avg"] = torch.zeros_like(p)
                     state["exp_avg_sq"] = torch.zeros_like(p)
-                    
+
                     if grad.ndim >= 2 and all(d <= max_dim for d in grad.shape):
-                        # Kronecker factors in full precision (will be quantized periodically)
+                        # Kronecker factors in fp32
                         state["L"] = torch.zeros(grad.shape[0], grad.shape[0], device=grad.device, dtype=torch.float32)
                         state["R"] = torch.zeros(grad.shape[-1], grad.shape[-1], device=grad.device, dtype=torch.float32)
-                        # Eigenbasis stored quantized
+                        # Eigenbasis: start with identity, will be quantized after first update
                         state["QL"] = torch.eye(grad.shape[0], device=grad.device, dtype=torch.float32)
                         state["QR"] = torch.eye(grad.shape[-1], device=grad.device, dtype=torch.float32)
-                        state["QL_quantized"] = None
-                        state["QR_quantized"] = None
-                
+                        state["QL_q"] = None  # (quantized, scale, zp, orig_cols)
+                        state["QR_q"] = None
+
                 state["step"] += 1
-                
-                # Weight decay
+
                 if weight_decay > 0:
                     p.mul_(1 - lr * weight_decay)
-                
+
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
-                
+
                 use_precond = grad.ndim >= 2 and "L" in state
-                
+
                 if use_precond:
                     L, R = state["L"], state["R"]
-                    
-                    # Dequantize eigenbasis if needed
-                    if state["QL_quantized"] is not None:
-                        QL = self._dequantize(*state["QL_quantized"])
-                        QR = self._dequantize(*state["QR_quantized"])
+
+                    # Dequantize eigenbasis if quantized
+                    if state["QL_q"] is not None:
+                        QL = self._dequantize_block(*state["QL_q"])
+                        QR = self._dequantize_block(*state["QR_q"])
                     else:
                         QL, QR = state["QL"], state["QR"]
-                    
+
                     # Update Kronecker factors
                     grad_float = grad.float()
                     if grad.ndim == 2:
                         L.mul_(shampoo_beta).add_(grad_float @ grad_float.T, alpha=1 - shampoo_beta)
                         R.mul_(shampoo_beta).add_(grad_float.T @ grad_float, alpha=1 - shampoo_beta)
-                    
-                    # Update and quantize eigenbasis periodically
+
+                    # Periodic eigenbasis update with block quantization
                     if state["step"] % precond_freq == 0:
                         QL_new = torch.linalg.qr(L @ QL)[0]
                         QR_new = torch.linalg.qr(R @ QR)[0]
-                        
-                        # Quantize eigenbasis for storage
-                        state["QL_quantized"] = self._quantize(QL_new)
-                        state["QR_quantized"] = self._quantize(QR_new)
-                        
-                        # Keep full precision for this step
+
+                        # Block quantize eigenbasis
+                        state["QL_q"] = self._quantize_block(QL_new)
+                        state["QR_q"] = self._quantize_block(QR_new)
+
                         QL, QR = QL_new, QR_new
-                    
-                    # Project gradient
+
                     grad_proj = QL.T @ grad_float @ QR
                     grad = grad_proj.to(grad.dtype)
-                
+
                 # Adam update
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                
+
                 bias_correction1 = 1 - beta1 ** state["step"]
                 bias_correction2 = 1 - beta2 ** state["step"]
-                
+
                 step_size = lr / bias_correction1
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
-                
+
                 update = exp_avg / denom
-                
+
                 if use_precond:
-                    if state["QL_quantized"] is not None:
-                        QL = self._dequantize(*state["QL_quantized"])
-                        QR = self._dequantize(*state["QR_quantized"])
+                    if state["QL_q"] is not None:
+                        QL = self._dequantize_block(*state["QL_q"])
+                        QR = self._dequantize_block(*state["QR_q"])
                     update = QL @ update.float() @ QR.T
                     update = update.to(p.dtype)
                 

@@ -5,6 +5,8 @@ Gated Delta Nets are a variant of linear attention with:
 - Delta rule update mechanism for recurrent state
 - Gating for selective memory updates
 - Sub-quadratic complexity O(n) for sequence length
+
+Kernels are imported from models.kernels for centralized optimization.
 """
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -13,6 +15,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+from models.kernels import (
+    create_rms_norm,
+    create_mlp,
+    compute_cross_entropy_loss,
+    create_cross_entropy_loss,
+)
 
 # Workaround for fla library conflict with transformers
 # The fla library tries to register 'bitnet' with AutoConfig/AutoModel/AutoModelForCausalLM
@@ -75,10 +84,10 @@ class GatedDeltaNetBlock(nn.Module):
     Single Gated Delta Net block with MLP.
 
     Architecture:
-    - Pre-norm with RMSNorm
+    - Pre-norm with RMSNorm (Liger optimized)
     - GatedDeltaNet mixer
-    - Post-norm with RMSNorm
-    - MLP with SwiGLU activation
+    - Post-norm with RMSNorm (Liger optimized)
+    - MLP with SwiGLU activation (Liger optimized)
     """
     def __init__(self, config: GatedDeltaNetConfig, layer_idx: int):
         super().__init__()
@@ -88,8 +97,8 @@ class GatedDeltaNetBlock(nn.Module):
         # Calculate num_heads from d_model and head_dim
         num_heads = config.d_model // config.head_dim
 
-        # Pre-norm
-        self.input_layernorm = nn.RMSNorm(config.d_model, eps=config.norm_eps)
+        # Pre-norm (uses Liger/Triton/baseline auto-selection)
+        self.input_layernorm = create_rms_norm(config.d_model, eps=config.norm_eps)
 
         # GatedDeltaNet mixer from flash-linear-attention
         self.mixer = GatedDeltaNet(
@@ -105,16 +114,14 @@ class GatedDeltaNetBlock(nn.Module):
             norm_eps=config.norm_eps,
         )
 
-        # Post-attention norm
-        self.post_attention_layernorm = nn.RMSNorm(config.d_model, eps=config.norm_eps)
+        # Post-attention norm (uses Liger/Triton/baseline auto-selection)
+        self.post_attention_layernorm = create_rms_norm(config.d_model, eps=config.norm_eps)
 
-        # MLP with SwiGLU
+        # MLP with SwiGLU (uses Liger/Triton/baseline auto-selection)
         self.intermediate_size = int(config.d_model * 8 / 3)  # SwiGLU uses 8/3 expansion
         self.intermediate_size = ((self.intermediate_size + 63) // 64) * 64  # Round to 64
 
-        self.gate_proj = nn.Linear(config.d_model, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.d_model, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, config.d_model, bias=False)
+        self.mlp = create_mlp(config.d_model, self.intermediate_size)
 
     def forward(
         self,
@@ -138,10 +145,10 @@ class GatedDeltaNetBlock(nn.Module):
 
         hidden_states = residual + hidden_states
 
-        # MLP with SwiGLU
+        # MLP with SwiGLU (uses optimized kernel)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states, new_cache
@@ -153,6 +160,7 @@ class GatedDeltaNetModel(nn.Module):
 
     Uses flash-linear-attention's GatedDeltaNet layers for efficient
     sequence modeling with linear complexity.
+    Kernels are auto-selected: Liger -> Triton -> baseline.
     """
     def __init__(self, config: GatedDeltaNetConfig):
         super().__init__()
@@ -168,11 +176,14 @@ class GatedDeltaNetModel(nn.Module):
             for layer_idx in range(config.n_layers)
         ])
 
-        # Final norm
-        self.norm = nn.RMSNorm(config.d_model, eps=config.norm_eps)
+        # Final norm (uses Liger/Triton/baseline auto-selection)
+        self.norm = create_rms_norm(config.d_model, eps=config.norm_eps)
 
         # LM head
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        # Fused cross-entropy loss (Liger if available)
+        self.loss_fn = create_cross_entropy_loss(self.lm_head)
 
         self._init_weights()
 
@@ -238,17 +249,15 @@ class GatedDeltaNetModel(nn.Module):
                 new_cache.append(cache)
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
 
-        loss = None
+        # Use fused linear + cross-entropy if available (Liger)
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
+            logits, loss = compute_cross_entropy_loss(
+                hidden_states, self.lm_head, labels, self.loss_fn
             )
+        else:
+            logits = self.lm_head(hidden_states)
+            loss = None
 
         return logits, loss, new_cache
 

@@ -56,6 +56,16 @@ else
     echo "Emerging-Optimizers already cloned"
 fi
 
+# Fix missing __init__.py in emerging_optimizers.soap subpackage
+echo "Patching emerging_optimizers.soap __init__.py..."
+python -c "
+import emerging_optimizers, os
+init_path = os.path.join(os.path.dirname(emerging_optimizers.__file__), 'soap', '__init__.py')
+if not os.path.exists(init_path):
+    open(init_path, 'w').write('from emerging_optimizers.soap.soap import SOAP\n')
+    print(f'Created {init_path}')
+"
+
 
 echo ""
 echo "=========================================="

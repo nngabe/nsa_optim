@@ -6,13 +6,10 @@ Implements transformer architecture with swappable attention mechanisms:
 - Native Sparse Attention (NSA)
 - Flash Sparse Attention (FSA)
 
-Supports optimized kernels:
-- Liger kernels (LigerRMSNorm, LigerSwiGLUMLP, liger_rotary_pos_emb, LigerFusedLinearCrossEntropyLoss)
-- Triton kernels (custom implementations)
-- Baseline PyTorch implementations
+Kernels are imported from models.kernels for centralized optimization.
 """
 import math
-from typing import Optional, Tuple, List, Literal
+from typing import Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -20,18 +17,23 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from config import ModelConfig, AttentionType
+from models.kernels import (
+    # Availability flags
+    LIGER_AVAILABLE,
+    # Baseline implementations
+    RotaryEmbedding,
+    # Factory functions
+    KernelType,
+    create_rms_norm,
+    create_mlp,
+    get_rotary_pos_emb_fn,
+)
 
-# Try to import Liger kernels
+# Try to import Liger for fused loss
 try:
-    from liger_kernel.transformers import (
-        LigerRMSNorm,
-        LigerSwiGLUMLP,
-        LigerFusedLinearCrossEntropyLoss,
-        liger_rotary_pos_emb,
-    )
-    LIGER_AVAILABLE = True
+    from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 except ImportError:
-    LIGER_AVAILABLE = False
+    LigerFusedLinearCrossEntropyLoss = None
 
 # Try to import FSA
 try:
@@ -39,307 +41,6 @@ try:
     FSA_AVAILABLE = True
 except ImportError:
     FSA_AVAILABLE = False
-
-
-# ============================================================================
-# Baseline Implementations
-# ============================================================================
-
-class RMSNorm(nn.Module):
-    """RMS Normalization - baseline PyTorch implementation"""
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x.to(dtype)
-
-
-class RotaryEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE) - baseline implementation"""
-    def __init__(self, dim: int, max_position_embeddings: int = 2048, base: float = 10000.0):
-        super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._set_cos_sin_cache(max_position_embeddings)
-
-    def _set_cos_sin_cache(self, seq_len: int):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
-
-    def forward(self, x: Tensor, position_ids: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        seq_len = x.shape[1]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len)
-
-        if position_ids is not None:
-            if position_ids.dim() == 2:
-                position_ids = position_ids.squeeze(0)
-            cos = self.cos_cached[position_ids]
-            sin = self.sin_cached[position_ids]
-        else:
-            cos = self.cos_cached[:seq_len]
-            sin = self.sin_cached[:seq_len]
-
-        return cos, sin
-
-
-def rotate_half(x: Tensor) -> Tensor:
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
-    """Apply rotary positional embeddings to query and key tensors - baseline"""
-    cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seq_len, 1, head_dim]
-    sin = sin.unsqueeze(0).unsqueeze(2)
-
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-class MLP(nn.Module):
-    """MLP with SwiGLU activation - baseline PyTorch implementation"""
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-# ============================================================================
-# Triton Implementations (Custom optimized kernels)
-# ============================================================================
-
-try:
-    import triton
-    import triton.language as tl
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-
-
-if TRITON_AVAILABLE:
-    @triton.jit
-    def _rms_norm_fwd_kernel(
-        X_ptr, W_ptr, Y_ptr,
-        stride_x_row, stride_y_row,
-        N, eps,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """Triton kernel for RMS normalization forward pass"""
-        row_idx = tl.program_id(0)
-        X_row_ptr = X_ptr + row_idx * stride_x_row
-        Y_row_ptr = Y_ptr + row_idx * stride_y_row
-
-        # Compute variance
-        _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        for col_start in range(0, N, BLOCK_SIZE):
-            col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-            mask = col_offsets < N
-            x = tl.load(X_row_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-            _var += x * x
-
-        var = tl.sum(_var) / N
-        rstd = tl.rsqrt(var + eps)
-
-        # Normalize and scale
-        for col_start in range(0, N, BLOCK_SIZE):
-            col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-            mask = col_offsets < N
-            x = tl.load(X_row_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-            w = tl.load(W_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-            y = x * rstd * w
-            tl.store(Y_row_ptr + col_offsets, y, mask=mask)
-
-
-    class TritonRMSNorm(nn.Module):
-        """RMS Normalization using Triton kernel"""
-        def __init__(self, hidden_size: int, eps: float = 1e-6):
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(hidden_size))
-            self.eps = eps
-            self.hidden_size = hidden_size
-
-        def forward(self, x: Tensor) -> Tensor:
-            if not x.is_cuda or x.shape[-1] > 8192:
-                # Fallback to baseline for CPU or very large hidden sizes
-                dtype = x.dtype
-                x_float = x.float()
-                variance = x_float.pow(2).mean(-1, keepdim=True)
-                x_norm = x_float * torch.rsqrt(variance + self.eps)
-                return self.weight * x_norm.to(dtype)
-
-            # Use Triton kernel
-            original_shape = x.shape
-            x = x.view(-1, self.hidden_size)
-            y = torch.empty_like(x)
-
-            M, N = x.shape
-            BLOCK_SIZE = triton.next_power_of_2(N)
-            if BLOCK_SIZE > 8192:
-                BLOCK_SIZE = 8192
-
-            _rms_norm_fwd_kernel[(M,)](
-                x, self.weight, y,
-                x.stride(0), y.stride(0),
-                N, self.eps,
-                BLOCK_SIZE=BLOCK_SIZE,
-            )
-
-            return y.view(original_shape)
-
-
-    @triton.jit
-    def _swiglu_fwd_kernel(
-        X_ptr, Gate_ptr, Up_ptr, Y_ptr,
-        stride_x, stride_g, stride_u, stride_y,
-        N,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """Triton kernel for SwiGLU forward pass"""
-        row_idx = tl.program_id(0)
-        X_row_ptr = X_ptr + row_idx * stride_x
-        Gate_row_ptr = Gate_ptr + row_idx * stride_g
-        Up_row_ptr = Up_ptr + row_idx * stride_u
-        Y_row_ptr = Y_ptr + row_idx * stride_y
-
-        for col_start in range(0, N, BLOCK_SIZE):
-            col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-            mask = col_offsets < N
-
-            gate = tl.load(Gate_row_ptr + col_offsets, mask=mask, other=0.0)
-            up = tl.load(Up_row_ptr + col_offsets, mask=mask, other=0.0)
-
-            # SiLU activation: x * sigmoid(x)
-            gate_silu = gate * tl.sigmoid(gate)
-            y = gate_silu * up
-
-            tl.store(Y_row_ptr + col_offsets, y, mask=mask)
-
-
-    class TritonSwiGLUMLP(nn.Module):
-        """MLP with SwiGLU activation using Triton kernel"""
-        def __init__(self, config: ModelConfig):
-            super().__init__()
-            self.hidden_size = config.hidden_size
-            self.intermediate_size = config.intermediate_size
-
-            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-        def forward(self, x: Tensor) -> Tensor:
-            gate = self.gate_proj(x)
-            up = self.up_proj(x)
-
-            if not x.is_cuda or self.intermediate_size > 65536:
-                # Fallback to baseline
-                return self.down_proj(F.silu(gate) * up)
-
-            # Use Triton kernel for fused SwiGLU
-            original_shape = gate.shape
-            gate_flat = gate.view(-1, self.intermediate_size)
-            up_flat = up.view(-1, self.intermediate_size)
-            y = torch.empty_like(gate_flat)
-
-            M, N = gate_flat.shape
-            BLOCK_SIZE = min(triton.next_power_of_2(N), 8192)
-
-            _swiglu_fwd_kernel[(M,)](
-                gate_flat, gate_flat, up_flat, y,
-                gate_flat.stride(0), gate_flat.stride(0), up_flat.stride(0), y.stride(0),
-                N,
-                BLOCK_SIZE=BLOCK_SIZE,
-            )
-
-            return self.down_proj(y.view(original_shape))
-
-else:
-    # Fallback if Triton not available
-    TritonRMSNorm = RMSNorm
-    TritonSwiGLUMLP = MLP
-
-
-# ============================================================================
-# Liger Implementations (Optimized fused kernels)
-# ============================================================================
-
-class LigerSwiGLUMLPWrapper(nn.Module):
-    """Wrapper for LigerSwiGLUMLP to match our interface"""
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        if LIGER_AVAILABLE:
-            # Create a config-like object for LigerSwiGLUMLP
-            class MLPConfig:
-                def __init__(self, hidden_size, intermediate_size):
-                    self.hidden_size = hidden_size
-                    self.intermediate_size = intermediate_size
-                    self.hidden_act = "silu"
-
-            self.mlp = LigerSwiGLUMLP(MLPConfig(config.hidden_size, config.intermediate_size))
-        else:
-            self.mlp = MLP(config)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.mlp(x)
-
-
-# ============================================================================
-# Factory functions to create the appropriate implementation
-# ============================================================================
-
-KernelType = Literal["baseline", "triton", "liger"]
-
-
-def create_rms_norm(hidden_size: int, eps: float = 1e-6, kernel_type: KernelType = "liger") -> nn.Module:
-    """Factory function to create RMSNorm with specified kernel type"""
-    if kernel_type == "liger" and LIGER_AVAILABLE:
-        return LigerRMSNorm(hidden_size, eps=eps)
-    elif kernel_type == "triton" and TRITON_AVAILABLE:
-        return TritonRMSNorm(hidden_size, eps=eps)
-    else:
-        return RMSNorm(hidden_size, eps=eps)
-
-
-def create_mlp(config: ModelConfig, kernel_type: KernelType = "liger") -> nn.Module:
-    """Factory function to create MLP with specified kernel type"""
-    if kernel_type == "liger" and LIGER_AVAILABLE:
-        return LigerSwiGLUMLPWrapper(config)
-    elif kernel_type == "triton" and TRITON_AVAILABLE:
-        return TritonSwiGLUMLP(config)
-    else:
-        return MLP(config)
-
-
-def get_rotary_pos_emb_fn(kernel_type: KernelType = "liger"):
-    """Get the appropriate rotary position embedding function"""
-    if kernel_type == "liger" and LIGER_AVAILABLE:
-        return liger_rotary_pos_emb
-    else:
-        return apply_rotary_pos_emb
 
 
 # ============================================================================
@@ -745,7 +446,7 @@ class TransformerBlock(nn.Module):
         else:
             self.self_attn = DenseAttention(config, layer_idx, kernel_type)
 
-        self.mlp = create_mlp(config, kernel_type)
+        self.mlp = create_mlp(config.hidden_size, config.intermediate_size, kernel_type)
         self.input_layernorm = create_rms_norm(config.hidden_size, eps=config.rms_norm_eps, kernel_type=kernel_type)
         self.post_attention_layernorm = create_rms_norm(config.hidden_size, eps=config.rms_norm_eps, kernel_type=kernel_type)
 
@@ -932,7 +633,7 @@ class TransformerModel(nn.Module):
                 shift_labels = labels[:, 1:].contiguous()
 
                 weight = self.lm_head.weight if self.lm_head is not None else self.embed_tokens.weight
-                loss = self.loss_fn(shift_hidden.view(-1, hidden_states.size(-1)), weight, shift_labels.view(-1))
+                loss = self.loss_fn(shift_hidden.view(-1, shift_hidden.size(-1)), weight, shift_labels.view(-1))
             elif logits_size_gb > 10.0:
                 # Compute loss in chunks without materializing full logits
                 loss = self._compute_loss_chunked(hidden_states, labels, chunk_size=4096)

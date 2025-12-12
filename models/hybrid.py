@@ -14,6 +14,8 @@ Optimizations (per CLAUDE.md):
 - Uses Liger kernels for RMSNorm, SwiGLU, and RoPE
 - Uses flash_attn for attention
 - Hidden sizes are power of 2 for Triton optimization
+
+Kernels are imported from models.kernels for centralized optimization.
 """
 import math
 from dataclasses import dataclass
@@ -25,6 +27,18 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from mamba_ssm import Mamba2
+
+# Import optimized kernels from centralized module
+from models.kernels import (
+    LIGER_AVAILABLE,
+    RotaryEmbedding,
+    rotate_half,
+    apply_rotary_pos_emb,
+    create_rms_norm,
+    create_mlp,
+    compute_cross_entropy_loss,
+    create_cross_entropy_loss,
+)
 
 # Workaround for fla library conflict with transformers
 # The fla library tries to register 'bitnet' with AutoConfig/AutoModel/AutoModelForCausalLM
@@ -65,17 +79,6 @@ def _import_fla_with_patch():
 
 GatedDeltaNet = _import_fla_with_patch()
 
-# Liger kernels for optimized ops
-try:
-    from liger_kernel.transformers import (
-        LigerRMSNorm,
-        LigerSwiGLUMLP,
-        liger_rotary_pos_emb,
-    )
-    LIGER_AVAILABLE = True
-except ImportError:
-    LIGER_AVAILABLE = False
-
 # Flash attention for optimized attention
 try:
     from flash_attn import flash_attn_func
@@ -87,58 +90,6 @@ except ImportError:
     FLASH_ATTN_AVAILABLE = False
     flash_rotary_emb = None
     FlashRotaryEmbedding = None
-
-
-# Baseline RMSNorm (fallback if Liger not available)
-class RMSNorm(nn.Module):
-    """RMS Normalization - baseline PyTorch implementation"""
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x: Tensor) -> Tensor:
-        dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x.to(dtype)
-
-
-def create_rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
-    """Factory: create optimized RMSNorm (Liger if available)"""
-    if LIGER_AVAILABLE:
-        return LigerRMSNorm(hidden_size, eps=eps)
-    return RMSNorm(hidden_size, eps=eps)
-
-
-class LigerSwiGLUMLPWrapper(nn.Module):
-    """Wrapper for LigerSwiGLUMLP to match our interface"""
-    def __init__(self, hidden_size: int, intermediate_size: int):
-        super().__init__()
-        if LIGER_AVAILABLE:
-            class MLPConfig:
-                def __init__(self, h, i):
-                    self.hidden_size = h
-                    self.intermediate_size = i
-                    self.hidden_act = "silu"
-            self.mlp = LigerSwiGLUMLP(MLPConfig(hidden_size, intermediate_size))
-        else:
-            # Fallback to manual SwiGLU
-            self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-            self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-            self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-            self.mlp = None
-
-    def forward(self, x: Tensor) -> Tensor:
-        if self.mlp is not None:
-            return self.mlp(x)
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-def create_swiglu_mlp(hidden_size: int, intermediate_size: int) -> nn.Module:
-    """Factory: create optimized SwiGLU MLP (Liger if available)"""
-    return LigerSwiGLUMLPWrapper(hidden_size, intermediate_size)
 
 
 @dataclass
@@ -185,10 +136,11 @@ class HybridConfig:
         return len(self.block_pattern) * self.block_repeats
 
 
-class RotaryEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE)
+class HybridRotaryEmbedding(nn.Module):
+    """Rotary Position Embedding (RoPE) for hybrid model.
 
     Returns cos/sin in flash_attn compatible format: (seq_len, dim/2)
+    This wraps the kernels.RotaryEmbedding but adapts output for flash_attn.
     """
     def __init__(self, dim: int, max_position_embeddings: int = 2048, base: float = 10000.0):
         super().__init__()
@@ -225,15 +177,8 @@ class RotaryEmbedding(nn.Module):
         return cos, sin
 
 
-def rotate_half(x: Tensor) -> Tensor:
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
-    """Apply rotary positional embeddings to query and key tensors.
+def apply_rotary_pos_emb_hybrid(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
+    """Apply rotary positional embeddings for hybrid model (flash_attn compatible format).
 
     Args:
         q, k: (batch, seq, heads, head_dim)
@@ -271,7 +216,7 @@ class MambaBlock(nn.Module):
         )
 
         self.post_mixer_norm = create_rms_norm(config.d_model, eps=config.norm_eps)
-        self.mlp = create_swiglu_mlp(config.d_model, config.intermediate_size)
+        self.mlp = create_mlp(config.d_model, config.intermediate_size)
 
     def forward(
         self,
@@ -318,7 +263,7 @@ class DeltaNetBlock(nn.Module):
         )
 
         self.post_mixer_norm = create_rms_norm(config.d_model, eps=config.norm_eps)
-        self.mlp = create_swiglu_mlp(config.d_model, config.intermediate_size)
+        self.mlp = create_mlp(config.d_model, config.intermediate_size)
 
     def forward(
         self,
@@ -365,14 +310,14 @@ class AttentionBlock(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = HybridRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
         )
 
         self.post_attn_norm = create_rms_norm(config.d_model, eps=config.norm_eps)
-        self.mlp = create_swiglu_mlp(config.d_model, config.intermediate_size)
+        self.mlp = create_mlp(config.d_model, config.intermediate_size)
 
     def _apply_rope(self, q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> Tuple[Tensor, Tensor]:
         """Apply RoPE using flash_attn's triton kernel if available, else fallback"""
@@ -384,7 +329,7 @@ class AttentionBlock(nn.Module):
             return q, k
         else:
             # Fallback uses (batch, seq, heads, head_dim) format
-            return apply_rotary_pos_emb(q, k, cos, sin)
+            return apply_rotary_pos_emb_hybrid(q, k, cos, sin)
 
     def forward(
         self,
@@ -490,6 +435,9 @@ class HybridModel(nn.Module):
         # LM head
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
+        # Fused cross-entropy loss (Liger if available)
+        self.loss_fn = create_cross_entropy_loss(self.lm_head)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -563,17 +511,15 @@ class HybridModel(nn.Module):
                 )
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
 
-        loss = None
+        # Use fused linear + cross-entropy if available (Liger)
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
+            logits, loss = compute_cross_entropy_loss(
+                hidden_states, self.lm_head, labels, self.loss_fn
             )
+        else:
+            logits = self.lm_head(hidden_states)
+            loss = None
 
         return logits, loss, None
 

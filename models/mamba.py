@@ -3,6 +3,8 @@ Mamba wrapper using the official mamba-ssm library.
 
 This module provides a unified interface for Mamba2 models that matches
 the interface expected by the training script.
+
+Kernels are imported from models.kernels for centralized optimization.
 """
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
@@ -16,6 +18,13 @@ from mamba_ssm import Mamba2
 from mamba_ssm.modules.block import Block
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+
+from models.kernels import (
+    create_rms_norm,
+    create_mlp,
+    compute_cross_entropy_loss,
+    create_cross_entropy_loss,
+)
 
 
 @dataclass
@@ -40,14 +49,15 @@ class Mamba2Block(nn.Module):
     Single Mamba2 block with MLP.
 
     Uses the official mamba_ssm.Mamba2 module.
+    Kernels are auto-selected: Liger -> Triton -> baseline.
     """
     def __init__(self, config: Mamba2Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
 
-        # Pre-norm
-        self.norm = nn.RMSNorm(config.d_model, eps=1e-6)
+        # Pre-norm (uses Liger/Triton/baseline auto-selection)
+        self.norm = create_rms_norm(config.d_model, eps=1e-6)
 
         # Mamba2 mixer from official library
         self.mixer = Mamba2(
@@ -59,16 +69,14 @@ class Mamba2Block(nn.Module):
             layer_idx=layer_idx,
         )
 
-        # Post-mixer norm
-        self.post_mixer_norm = nn.RMSNorm(config.d_model, eps=1e-6)
+        # Post-mixer norm (uses Liger/Triton/baseline auto-selection)
+        self.post_mixer_norm = create_rms_norm(config.d_model, eps=1e-6)
 
-        # MLP with SwiGLU
+        # MLP with SwiGLU (uses Liger/Triton/baseline auto-selection)
         self.intermediate_size = int(config.d_model * 8 / 3)
         self.intermediate_size = ((self.intermediate_size + 63) // 64) * 64
 
-        self.gate_proj = nn.Linear(config.d_model, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.d_model, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, config.d_model, bias=False)
+        self.mlp = create_mlp(config.d_model, self.intermediate_size)
 
     def forward(
         self,
@@ -82,10 +90,10 @@ class Mamba2Block(nn.Module):
         hidden_states = self.mixer(hidden_states, inference_params=inference_params)
         hidden_states = residual + hidden_states
 
-        # MLP with SwiGLU
+        # MLP with SwiGLU (uses optimized kernel)
         residual = hidden_states
         hidden_states = self.post_mixer_norm(hidden_states)
-        hidden_states = self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states, None
@@ -96,6 +104,7 @@ class Mamba2Model(nn.Module):
     Full Mamba2 model for causal language modeling.
 
     Uses the official mamba-ssm library's Mamba2 modules.
+    Kernels are auto-selected: Liger -> Triton -> baseline.
     """
     def __init__(self, config: Mamba2Config):
         super().__init__()
@@ -111,11 +120,14 @@ class Mamba2Model(nn.Module):
             for layer_idx in range(config.n_layers)
         ])
 
-        # Final norm
-        self.norm = nn.RMSNorm(config.d_model, eps=1e-6)
+        # Final norm (uses Liger/Triton/baseline auto-selection)
+        self.norm = create_rms_norm(config.d_model, eps=1e-6)
 
         # LM head
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        # Fused cross-entropy loss (Liger if available)
+        self.loss_fn = create_cross_entropy_loss(self.lm_head)
 
         self._init_weights()
 
@@ -169,17 +181,15 @@ class Mamba2Model(nn.Module):
                 )
 
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
 
-        loss = None
+        # Use fused linear + cross-entropy if available (Liger)
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
+            logits, loss = compute_cross_entropy_loss(
+                hidden_states, self.lm_head, labels, self.loss_fn
             )
+        else:
+            logits = self.lm_head(hidden_states)
+            loss = None
 
         return logits, loss, None
 

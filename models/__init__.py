@@ -6,7 +6,30 @@ Contains:
 - Mamba2Model: Mamba-2 state space model
 - GatedDeltaNetModel: Gated Delta Net linear attention
 - HybridModel: Hybrid model with interleaved blocks
+
+Optimized kernels are centralized in models.kernels for:
+- RMSNorm (Liger/Triton/baseline)
+- SwiGLU MLP (Liger/Triton/baseline)
+- RoPE (Liger/baseline)
+- Cross-entropy loss (Liger fused/baseline)
 """
+
+# Import kernels from centralized module
+from models.kernels import (
+    LIGER_AVAILABLE,
+    TRITON_AVAILABLE,
+    RMSNorm,
+    RotaryEmbedding,
+    MLP,
+    rotate_half,
+    apply_rotary_pos_emb,
+    KernelType,
+    create_rms_norm,
+    create_mlp,
+    get_rotary_pos_emb_fn,
+    create_cross_entropy_loss,
+    compute_cross_entropy_loss,
+)
 
 from models.transformer import (
     TransformerModel,
@@ -14,19 +37,8 @@ from models.transformer import (
     DenseAttention,
     NativeSparseAttention,
     FlashSparseAttention,
-    RMSNorm,
-    RotaryEmbedding,
-    MLP,
-    create_model,
-    create_rms_norm,
-    create_mlp,
-    apply_rotary_pos_emb,
-    rotate_half,
-    get_rotary_pos_emb_fn,
-    LIGER_AVAILABLE,
     FSA_AVAILABLE,
-    TRITON_AVAILABLE,
-    KernelType,
+    create_model,
 )
 
 from models.mamba import (
@@ -63,25 +75,28 @@ from models.configs import (
 )
 
 __all__ = [
+    # Kernels (from models.kernels)
+    "LIGER_AVAILABLE",
+    "TRITON_AVAILABLE",
+    "RMSNorm",
+    "RotaryEmbedding",
+    "MLP",
+    "rotate_half",
+    "apply_rotary_pos_emb",
+    "KernelType",
+    "create_rms_norm",
+    "create_mlp",
+    "get_rotary_pos_emb_fn",
+    "create_cross_entropy_loss",
+    "compute_cross_entropy_loss",
     # Transformer
     "TransformerModel",
     "TransformerBlock",
     "DenseAttention",
     "NativeSparseAttention",
     "FlashSparseAttention",
-    "RMSNorm",
-    "RotaryEmbedding",
-    "MLP",
-    "create_model",
-    "create_rms_norm",
-    "create_mlp",
-    "apply_rotary_pos_emb",
-    "rotate_half",
-    "get_rotary_pos_emb_fn",
-    "LIGER_AVAILABLE",
     "FSA_AVAILABLE",
-    "TRITON_AVAILABLE",
-    "KernelType",
+    "create_model",
     # Mamba
     "Mamba2Model",
     "Mamba2Config",

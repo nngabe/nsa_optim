@@ -118,72 +118,11 @@ The smoke test script tests:
 - ✓ Gradient checkpointing
 - ✓ SOAP optimizer (if available)
 
-### Single Experiment
 
-```bash
-# Train a 0.6B model with dense attention and AdamW
-python train.py \
-    --model_size 0.6B \
-    --attention_type dense \
-    --optimizer_type adamw \
-    --context_length 32768 \
-    --batch_size 4 \
-    --gradient_accumulation_steps 4 \
-    --num_train_steps 100000 \
     --output_dir ./outputs
-
-# Train with NSA and SOAP optimizer
-python train.py \
-    --model_size 0.6B \
-    --attention_type native_sparse_attention \
-    --optimizer_type soap \
-    --context_length 131072 \
-    --gradient_checkpointing \
-    --output_dir ./outputs
-```
-
-### Multi-GPU Training
-
-```bash
-# Using torchrun for distributed training
-torchrun --nproc_per_node=8 train.py \
-    --model_size 4B \
-    --attention_type native_sparse_attention \
-    --optimizer_type soap \
-    --context_length 131072 \
-    --batch_size 1 \
-    --gradient_accumulation_steps 16 \
-    --dtype bfloat16 \
-    --gradient_checkpointing
-```
-
-### Run All Experiments
-
-```bash
-# Generate experiment manifest
-python run_experiments.py --mode=generate
-
-# Run subset of experiments locally
-python run_experiments.py \
-    --mode=run \
-    --model_sizes 0.6B \
-    --attention_types dense native_sparse_attention \
-    --optimizer_types adamw soap \
-    --num_gpus=8
 ```
 
 ## Model Architecture
-
-Models follow the Qwen-3 architecture:
-
-| Size | Hidden | Layers | Heads | KV Heads | Intermediate |
-|------|--------|--------|-------|----------|--------------|
-| 0.6B | 1024   | 28     | 16    | 8        | 3072         |
-| 4B   | 2560   | 36     | 32    | 8        | 9216         |
-| 8B   | 4096   | 36     | 32    | 8        | 12288        |
-| 32B  | 5120   | 64     | 40    | 8        | 25600        |
-
-### Attention Mechanisms
 
 **Dense Attention**: Standard multi-head attention with FlashAttention-2 backend. O(n²) complexity.
 
@@ -216,9 +155,6 @@ Training logs to wandb by default:
 ```bash
 # Set wandb project
 export WANDB_PROJECT=nsa-optimizer-ablation
-
-# View experiments
-wandb login
 ```
 
 Logged metrics:

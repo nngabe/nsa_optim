@@ -28,7 +28,7 @@ Run the Docker Container for Blackwell GPUs [Dockerhub](https://hub.docker.com/r
 ```
 docker run --rm -it --gpus all nickgabriel/blackwell-cuda131:latest
 ```
-This image specifically targets archs sm_100 and sm_120 for Blackwell GPUs, with the most up-to-date and performant support for 4-bit/8-bit states and mixed precision operations. 
+This image specifically targets archs sm_100 and sm_120 for Blackwell GPUs, with the most up-to-date kernels and support for 4-bit/8-bit states and mixed precision operations. 
 
 If you'd like to run experiments on Ampere/Hopper GPUs, use available images like 
 ```

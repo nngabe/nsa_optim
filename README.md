@@ -35,6 +35,18 @@ If you'd like to run experiments on Ampere/Hopper GPUs, use available images lik
 docker run -rm -it --gpus all nvcr.io/nvidia/pytorch:24.04-py3
 ```
 
+To install the remaining python dependencies, use 
+```
+source scripts/setup.sh
+```
+
+## Quickstart
+To train hybrid models, you can specify the block structure with a string, e.g. `MDMA` where `M=Mamba`, `A=Attention`, and `D=DeltaNet`. Attention types for the `A` blocks can be set to sparse or dense using the --attn_type flag. For example, to train a 1B model with `AdamW8bit` from `torchao` we can use:
+```
+python train.py --model_size 1B --block_pattern MDMA --attn_type nsa --optimizer_type adamw8bit
+```
+
+
 ## Project Structure
 
 ```

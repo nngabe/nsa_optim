@@ -6,8 +6,10 @@ echo "NSA + Optimizer Smoke Tests"
 echo "=========================================="
 echo ""
 
-# Activate environment
-source venv/bin/activate
+# Activate environment if it exists
+if [ -d "venv" ]; then
+    source venv/bin/activate
+fi
 
 # Detect number of GPUs
 NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
@@ -92,94 +94,187 @@ echo ""
 echo "Step 2: Training Smoke Tests"
 echo "=========================================="
 
-# Test 1: AdamW with bfloat16 (baseline)
-run_test "AdamW + BFloat16 (Baseline)" \
+# Common training parameters for all tests
+MODEL_SIZE="100M"  # Small model for fast smoke tests
+CONTEXT_LENGTH=512
+NUM_TRAIN_STEPS=2
+LOG_INTERVAL=1
+BATCH_SIZE=1
+GRAD_ACCUM_STEPS=2
+DTYPE="bfloat16"
+
+###############################################################################
+# AdamW8bit Tests
+###############################################################################
+
+echo ""
+echo "=========================================="
+echo "AdamW8bit Optimizer Tests"
+echo "=========================================="
+
+# Test 1: AdamW8bit with 'A'/dense (Attention with dense attention)
+run_test "AdamW8bit + A/dense" \
     "$TRAIN_CMD train.py \
-      --model_size 0.6B \
-      --attention_type dense \
+      --model_size $MODEL_SIZE \
+      --attn_type dense \
+      --optimizer_type adamw8bit \
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
+      --output_dir ./outputs/smoke_test_adamw8bit_a_dense" || true
+
+# Test 2: AdamW8bit with 'A'/sparse (Attention with NSA sparse attention)
+run_test "AdamW8bit + A/sparse" \
+    "$TRAIN_CMD train.py \
+      --model_size $MODEL_SIZE \
+      --attn_type native_sparse_attention \
+      --nsa_block_size 64 \
+      --nsa_window_size 64 \
+      --nsa_num_selected_blocks 4 \
+      --optimizer_type adamw8bit \
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
+      --output_dir ./outputs/smoke_test_adamw8bit_a_sparse" || true
+
+# Test 3: AdamW8bit with 'D' (DeltaNet blocks)
+run_test "AdamW8bit + D" \
+    "$TRAIN_CMD train.py \
+      --model_size $MODEL_SIZE \
+      --block_pattern D \
+      --block_repeats 2 \
+      --optimizer_type adamw8bit \
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
+      --output_dir ./outputs/smoke_test_adamw8bit_d" || true
+
+# Test 4: AdamW8bit with 'M' (Mamba blocks)
+run_test "AdamW8bit + M" \
+    "$TRAIN_CMD train.py \
+      --model_size $MODEL_SIZE \
+      --block_pattern M \
+      --block_repeats 2 \
+      --optimizer_type adamw8bit \
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
+      --output_dir ./outputs/smoke_test_adamw8bit_m" || true
+
+# Test 5: AdamW8bit with 'MDMA'/sparse (Mixed blocks: Mamba-DeltaNet-Mamba-Attention)
+run_test "AdamW8bit + MDMA/sparse" \
+    "$TRAIN_CMD train.py \
+      --model_size $MODEL_SIZE \
+      --block_pattern MDMA \
+      --block_repeats 2 \
+      --optimizer_type adamw8bit \
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
+      --output_dir ./outputs/smoke_test_adamw8bit_mdma_sparse" || true
+
+###############################################################################
+# SOAP8bit Tests
+###############################################################################
+
+echo ""
+echo "=========================================="
+echo "SOAP8bit Optimizer Tests"
+echo "=========================================="
+
+# Test 6: SOAP8bit with 'MDMA'/sparse (Mixed blocks: Mamba-DeltaNet-Mamba-Attention)
+run_test "SOAP8bit + MDMA/sparse" \
+    "$TRAIN_CMD train.py \
+      --model_size $MODEL_SIZE \
+      --block_pattern MDMA \
+      --block_repeats 2 \
+      --optimizer_type soap8bit \
+      --precondition_frequency 5 \
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
+      --output_dir ./outputs/smoke_test_soap8bit_mdma_sparse" || true
+
+###############################################################################
+# SOAP4bit Tests
+###############################################################################
+
+echo ""
+echo "=========================================="
+echo "SOAP4bit Optimizer Tests"
+echo "=========================================="
+
+# Test 7: SOAP4bit with 'MDMA'/sparse (Mixed blocks: Mamba-DeltaNet-Mamba-Attention)
+run_test "SOAP4bit + MDMA/sparse" \
+    "$TRAIN_CMD train.py \
+      --model_size $MODEL_SIZE \
+      --block_pattern MDMA \
+      --block_repeats 2 \
+      --optimizer_type soap4bit \
+      --precondition_frequency 5 \
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
+      --output_dir ./outputs/smoke_test_soap4bit_mdma_sparse" || true
+
+###############################################################################
+# Baseline Tests (for reference)
+###############################################################################
+
+echo ""
+echo "=========================================="
+echo "Baseline Tests (AdamW)"
+echo "=========================================="
+
+# Test 8: AdamW baseline with dense attention (for comparison)
+run_test "AdamW (baseline) + dense" \
+    "$TRAIN_CMD train.py \
+      --model_size $MODEL_SIZE \
+      --attn_type dense \
       --optimizer_type adamw \
-      --context_length 32768 \
-      --num_train_steps 2 \
-      --log_interval 1 \
-      --batch_size 1 \
-      --gradient_accumulation_steps 4 \
-      --dtype bfloat16 \
-      --output_dir ./outputs/smoke_test_adamw" || true
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
+      --output_dir ./outputs/smoke_test_adamw_baseline" || true
 
-# Test 2: AdamW8bit with bfloat16
-run_test "AdamW8bit + BFloat16" \
-    "$TRAIN_CMD train.py \
-      --model_size 0.6B \
-      --attention_type dense \
-      --optimizer_type adamw_8bit \
-      --context_length 32768 \
-      --num_train_steps 2 \
-      --log_interval 1 \
-      --batch_size 1 \
-      --gradient_accumulation_steps 4 \
-      --dtype bfloat16 \
-      --output_dir ./outputs/smoke_test_adamw8bit" || true
-
-# Test 3: AdamW with NSA
-run_test "AdamW + Float16" \
-    "$TRAIN_CMD train.py \
-      --model_size 0.6B \
-      --attention_type native_sparse_attention \
-      --optimizer_type adamw \
-      --context_length 32768 \
-      --num_train_steps 2 \
-      --log_interval 1 \
-      --batch_size 1 \
-      --gradient_accumulation_steps 4 \
-      --dtype float16 \
-      --output_dir ./outputs/smoke_test_nsa" || true
-
-# Test 5: Gradient checkpointing
+# Test 9: AdamW with gradient checkpointing (memory efficiency test)
 run_test "AdamW + Gradient Checkpointing" \
     "$TRAIN_CMD train.py \
-      --model_size 0.6B \
-      --attention_type dense \
+      --model_size $MODEL_SIZE \
+      --attn_type dense \
       --optimizer_type adamw \
-      --context_length 32768 \
-      --num_train_steps 2 \
-      --log_interval 1 \
-      --batch_size 1 \
-      --gradient_accumulation_steps 4 \
-      --dtype bfloat16 \
+      --context_length $CONTEXT_LENGTH \
+      --num_train_steps $NUM_TRAIN_STEPS \
+      --log_interval $LOG_INTERVAL \
+      --batch_size $BATCH_SIZE \
+      --gradient_accumulation_steps $GRAD_ACCUM_STEPS \
+      --dtype $DTYPE \
       --gradient_checkpointing \
-      --output_dir ./outputs/smoke_test_gradckpt" || true
-
-# Test 6: SOAP optimizer (if available)
-echo ""
-echo "Testing SOAP optimizer (may skip if not installed)..."
-run_test "SOAP + BFloat16" \
-    "$TRAIN_CMD train.py \
-      --model_size 0.6B \
-      --attention_type dense \
-      --optimizer_type soap \
-      --context_length 32768 \
-      --num_train_steps 2 \
-      --log_interval 1 \
-      --batch_size 1 \
-      --gradient_accumulation_steps 4 \
-      --dtype bfloat16 \
-      --output_dir ./outputs/smoke_test_soap" || true
-
-# Test 7: SOAP lowbit 
-echo ""
-echo "Testing SOAP optimizer (may skip if not installed)..."
-run_test "SOAP + BFloat16" \
-    "$TRAIN_CMD train.py \
-      --model_size 0.6B \
-      --attention_type dense \
-      --optimizer_type soap \
-      --context_length 32768 \
-      --num_train_steps 2 \
-      --log_interval 1 \
-      --batch_size 1 \
-      --gradient_accumulation_steps 4 \
-      --dtype bfloat16 \
-      --output_dir ./outputs/smoke_test_soap_lowbit" || true
+      --output_dir ./outputs/smoke_test_adamw_gradckpt" || true
 
 # Print final summary
 print_summary

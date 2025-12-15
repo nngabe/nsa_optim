@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Output directories
+outputs/
+wandb/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Cache directories
+.pip-cache/
+.torch-cache/
+.hf-cache/
+.cache/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig

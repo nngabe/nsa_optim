@@ -45,6 +45,10 @@ To train hybrid models, you can specify the block structure with a string, e.g. 
 ```
 python train.py --model_size 1B --block_pattern MDMA --attn_type nsa --optimizer_type adamw8bit
 ```
+or to launch multi-GPU training with FSDP use:
+```
+torchrun --nproc_per_node=4 train.py --model_size 1B --block_pattern MDMA --attn_type nsa --optimizer_type adamw8bit
+```
 
 
 ## Project Structure

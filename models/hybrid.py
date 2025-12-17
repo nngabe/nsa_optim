@@ -117,7 +117,7 @@ class HybridConfig:
     num_attention_heads: int = 16
     num_key_value_heads: int = 8
     max_position_embeddings: int = 131072
-    rope_theta: float = 10000.0
+    rope_theta: float = 100000.0
 
     # Common config
     intermediate_size: int = None  # Computed from d_model if None

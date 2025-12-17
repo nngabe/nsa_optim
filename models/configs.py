@@ -30,6 +30,7 @@ def get_model_config(
     nsa_block_size: int = 64,
     nsa_window_size: int = 64,
     nsa_num_selected_blocks: int = 16,
+    rope_theta: float = 100000.0,
 ) -> ModelConfig:
     """Get model configuration based on training config, computing dimensions dynamically"""
     return get_model_config_for_size(
@@ -39,6 +40,7 @@ def get_model_config(
         nsa_block_size=nsa_block_size,
         nsa_window_size=nsa_window_size,
         nsa_num_selected_blocks=nsa_num_selected_blocks,
+        rope_theta=rope_theta,
     )
 
 
@@ -124,6 +126,7 @@ def get_hybrid_config(
     mamba_d_conv: int = 4,
     mamba_expand: int = 2,
     mamba_headdim: int = 64,
+    rope_theta: float = 100000.0,
 ) -> HybridConfig:
     """Get Hybrid model configuration based on training config and pattern, computing dimensions dynamically"""
     # Auto-compute block_repeats if -1
@@ -155,7 +158,7 @@ def get_hybrid_config(
         num_attention_heads=num_heads,
         num_key_value_heads=num_kv_heads,
         max_position_embeddings=training_config.max_seq_length,
-        rope_theta=10000.0,
+        rope_theta=rope_theta,
         intermediate_size=intermediate_size,
         norm_eps=1e-6,
         gradient_checkpointing=training_config.gradient_checkpointing,

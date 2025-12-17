@@ -54,7 +54,7 @@ class ModelConfig:
     intermediate_size: int
     vocab_size: int = 151936  # Qwen vocab size
     max_position_embeddings: int = 32768
-    rope_theta: float = 10000.0
+    rope_theta: float = 100000.0
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = False
     attention_type: AttentionType = AttentionType.DENSE
@@ -233,6 +233,7 @@ def get_model_config_for_size(
     nsa_block_size: int = 64,
     nsa_window_size: int = 64,
     nsa_num_selected_blocks: int = 16,
+    rope_theta: float = 100000.0,
 ) -> ModelConfig:
     """
     Get model configuration for a given size string.
@@ -275,6 +276,7 @@ def get_model_config_for_size(
         intermediate_size=intermediate_size,
         vocab_size=vocab_size,
         max_position_embeddings=max_position_embeddings,
+        rope_theta=rope_theta,
         attention_type=attention_type,
         nsa_block_size=nsa_block_size,
         nsa_window_size=nsa_window_size,

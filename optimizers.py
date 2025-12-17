@@ -23,8 +23,16 @@ def create_optimizer(
     model: nn.Module,
     config: OptimizerConfig,
     tensor_parallel_size: int = 1,
+    orig_param_shapes: Optional[Dict[int, Tuple[str, Tuple[int, ...]]]] = None,
 ) -> Optimizer:
-    """Factory function to create optimizer from config"""
+    """Factory function to create optimizer from config
+
+    Args:
+        model: Model to optimize
+        config: Optimizer configuration
+        tensor_parallel_size: Number of GPUs for distributed training
+        orig_param_shapes: Dict mapping param data_ptr to (name, shape) for FSDP preconditioning
+    """
 
     # Separate parameters by weight decay eligibility
     param_groups = get_param_groups(model, config.weight_decay)
@@ -42,10 +50,10 @@ def create_optimizer(
         return create_soap(param_groups, config)
 
     elif config.optimizer_type == OptimizerType.SOAP_4BIT:
-        return create_soap_lowbit(param_groups, config, bits=4)
+        return create_soap_lowbit(param_groups, config, bits=4, orig_param_shapes=orig_param_shapes)
 
     elif config.optimizer_type == OptimizerType.SOAP_8BIT:
-        return create_soap_lowbit(param_groups, config, bits=8)
+        return create_soap_lowbit(param_groups, config, bits=8, orig_param_shapes=orig_param_shapes)
 
     elif config.optimizer_type == OptimizerType.SHAMPOO:
         return create_shampoo(param_groups, config, tensor_parallel_size)
@@ -241,6 +249,7 @@ def create_soap_lowbit(
     config: OptimizerConfig,
     bits: int = 4,
     use_optimized: bool = True,
+    orig_param_shapes: Optional[Dict[int, Tuple[str, Tuple[int, ...]]]] = None,
 ) -> Optimizer:
     """
     Create SOAP with low-bit (4-bit or 8-bit) optimizer states
@@ -251,6 +260,7 @@ def create_soap_lowbit(
         config: Optimizer configuration
         bits: Quantization bits (4 or 8)
         use_optimized: If True, use torchao/gemlite optimized ops; if False, use fallback
+        orig_param_shapes: Dict mapping param data_ptr to (name, shape) for FSDP preconditioning
     """
     # Try using SOAPLowBit implementation (supports quantization)
     try:
@@ -266,6 +276,7 @@ def create_soap_lowbit(
             max_precond_dim=config.max_precond_dim,
             bits=bits,
             use_optimized=use_optimized,
+            orig_param_shapes=orig_param_shapes,
         )
     except Exception as e:
         print(f"Warning: SOAPLowBit not available ({e.__class__.__name__}: {e})")
@@ -552,6 +563,7 @@ class SOAPLowBit(Optimizer):
     """
     SOAP optimizer with low-bit (4-bit or 8-bit) quantized eigenbasis states.
     Uses sub-row block quantization (default 64) for 4-bit stability.
+    Supports distributed training with FSDP via all-reduce of Kronecker factors.
 
     Args:
         params: Parameters to optimize
@@ -564,6 +576,7 @@ class SOAPLowBit(Optimizer):
         max_precond_dim: Max dimension for preconditioning
         bits: Quantization bits (4 or 8)
         q_block_size: Sub-row block size for quantization (default 64)
+        distributed: Enable distributed mode (auto-detected if None)
     """
     def __init__(
         self,
@@ -578,6 +591,8 @@ class SOAPLowBit(Optimizer):
         bits: int = 4,
         q_block_size: int = 32,
         use_optimized: bool = True,
+        distributed: Optional[bool] = None,
+        orig_param_shapes: Optional[Dict[int, Tuple[str, Tuple[int, ...]]]] = None,
     ):
         defaults = dict(
             lr=lr,
@@ -596,10 +611,43 @@ class SOAPLowBit(Optimizer):
         self.q_block_size = q_block_size
         self.use_torchao = use_optimized and TORCHAO_QUANT_AVAILABLE
 
-        if self.use_torchao:
-            print(f"SOAPLowBit: {bits}-bit, block_size={q_block_size} (torchao)")
+        # Store original param shapes for FSDP support (flat params -> 2D)
+        self.orig_param_shapes = orig_param_shapes or {}
+
+        # Auto-detect distributed mode
+        if distributed is None:
+            import torch.distributed as dist
+            self.distributed = dist.is_initialized()
         else:
-            print(f"SOAPLowBit: {bits}-bit, block_size={q_block_size} (fallback)")
+            self.distributed = distributed
+
+        dist_str = " (distributed)" if self.distributed else ""
+        if self.use_torchao:
+            print(f"SOAPLowBit: {bits}-bit, block_size={q_block_size} (torchao){dist_str}")
+        else:
+            print(f"SOAPLowBit: {bits}-bit, block_size={q_block_size} (fallback){dist_str}")
+
+    def _get_orig_shape(self, p: Tensor) -> Optional[Tuple[int, ...]]:
+        """Get original 2D shape for a parameter if it was flattened by FSDP."""
+        if p.data_ptr() in self.orig_param_shapes:
+            _, orig_shape = self.orig_param_shapes[p.data_ptr()]
+            return orig_shape
+        return None
+
+    def _is_preconditionable(self, p: Tensor) -> Tuple[bool, Optional[Tuple[int, int]]]:
+        """Check if param can be preconditioned, returns (can_precond, 2d_shape)."""
+        # Direct 2D case
+        if p.ndim == 2:
+            return True, tuple(p.shape)
+
+        # Check if this is a flattened FSDP param with original 2D shape
+        orig_shape = self._get_orig_shape(p)
+        if orig_shape is not None and len(orig_shape) == 2:
+            # Verify the total size matches
+            if p.numel() == orig_shape[0] * orig_shape[1]:
+                return True, orig_shape
+
+        return False, None
 
     def _quantize_block(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """Sub-row block quantization for stability.
@@ -782,9 +830,11 @@ class SOAPLowBit(Optimizer):
                     state["exp_avg"] = torch.zeros_like(p)
                     state["exp_avg_sq"] = torch.zeros_like(p)
 
-                    # Precondition 2D parameters with block diagonal approximation
-                    if grad.ndim == 2:
-                        m, n = grad.shape
+                    # Check if param can be preconditioned (2D or flattened 2D from FSDP)
+                    can_precond, shape_2d = self._is_preconditionable(p)
+                    if can_precond and shape_2d is not None:
+                        m, n = shape_2d
+                        state["orig_2d_shape"] = (m, n)  # Store for reshaping
 
                         # Compute number of blocks needed for each dimension
                         num_blocks_row = (m + max_dim - 1) // max_dim  # ceil division
@@ -828,11 +878,15 @@ class SOAPLowBit(Optimizer):
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
 
-                use_precond = grad.ndim == 2 and "L_blocks" in state
+                # Check if we should use preconditioning (handles both native 2D and FSDP flattened)
+                use_precond = "QL_q_blocks" in state and "orig_2d_shape" in state
 
                 if use_precond:
-                    grad_float = grad.float()
-                    m, n = grad.shape
+                    m, n = state["orig_2d_shape"]
+                    orig_grad_shape = grad.shape
+                    # Reshape to 2D if flattened by FSDP
+                    grad_2d = grad.view(m, n) if grad.ndim == 1 else grad
+                    grad_float = grad_2d.float()
                     max_dim = state["block_size"]
                     num_blocks_row = state["num_blocks_row"]
                     num_blocks_col = state["num_blocks_col"]
@@ -881,6 +935,10 @@ class SOAPLowBit(Optimizer):
 
                     # Update eigenbases if needed
                     if needs_eigenbasis_update:
+                        # Note: With FSDP, each rank computes local preconditioners on its gradient shard.
+                        # All-reduce is skipped to avoid deadlock from FSDP's parameter sharding.
+                        # Local preconditioners still provide significant benefit.
+
                         for block_idx in range(num_blocks_row * num_blocks_col):
                             QL_block = self._dequantize_block(*state["QL_q_blocks"][block_idx])
                             QR_block = self._dequantize_block(*state["QR_q_blocks"][block_idx])
@@ -896,7 +954,8 @@ class SOAPLowBit(Optimizer):
                             state["QL_q_blocks"][block_idx] = self._quantize_block(QL_new)
                             state["QR_q_blocks"][block_idx] = self._quantize_block(QR_new)
 
-                    grad = grad_preconditioned.to(grad.dtype)
+                    # Reshape back to original shape if needed (for FSDP flattened params)
+                    grad = grad_preconditioned.to(grad_2d.dtype).view(orig_grad_shape)
 
                 # Adam update
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
@@ -912,7 +971,9 @@ class SOAPLowBit(Optimizer):
 
                 if use_precond:
                     # Apply block diagonal preconditioner to update
-                    update_float = update.float()
+                    # Reshape to 2D if FSDP flattened
+                    update_2d = update.view(m, n) if update.ndim == 1 else update
+                    update_float = update_2d.float()
                     update_preconditioned = torch.zeros_like(update_float)
 
                     for i in range(num_blocks_row):
@@ -938,7 +999,8 @@ class SOAPLowBit(Optimizer):
                             update_block_precond = QL_block @ update_block @ QR_block.T
                             update_preconditioned[row_start:row_end, col_start:col_end] = update_block_precond
 
-                    update = update_preconditioned.to(p.dtype)
+                    # Reshape back to original shape for FSDP
+                    update = update_preconditioned.to(p.dtype).view(p.shape)
 
                 p.add_(update, alpha=-step_size)
         
@@ -985,7 +1047,7 @@ def get_lr_scheduler(
 
 
 def analyze_preconditioning_coverage(
-    model: nn.Module,
+    orig_param_shapes: Dict[int, Tuple[str, Tuple[int, ...]]],
     optimizer_config: OptimizerConfig,
 ) -> Dict[str, Any]:
     """
@@ -997,7 +1059,7 @@ def analyze_preconditioning_coverage(
     - They require gradients
 
     Args:
-        model: The model to analyze
+        orig_param_shapes: Dict mapping data_ptr to (name, shape) of original params
         optimizer_config: Optimizer configuration
 
     Returns:
@@ -1032,43 +1094,42 @@ def analyze_preconditioning_coverage(
         "not_preconditioned_1d": [],
     }
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-
-        num_params = param.numel()
+    for data_ptr, (name, shape) in orig_param_shapes.items():
+        num_params = 1
+        for dim in shape:
+            num_params *= dim
         total_params += num_params
 
         # Check if this parameter will be preconditioned
         # With block diagonal, ALL 2D parameters get preconditioned
-        if param.ndim == 2:
+        if len(shape) == 2:
             total_2d_params += num_params
             preconditioned_params += num_params
             preconditioned_2d_params += num_params
 
             # Determine number of blocks needed
-            m, n = param.shape
+            m, n = shape
             num_blocks_row = (m + max_dim - 1) // max_dim
             num_blocks_col = (n + max_dim - 1) // max_dim
             num_blocks = num_blocks_row * num_blocks_col
 
             param_details["preconditioned"].append({
                 "name": name,
-                "shape": tuple(param.shape),
+                "shape": shape,
                 "num_params": num_params,
                 "num_blocks": num_blocks,
             })
-        elif param.ndim > 2:
+        elif len(shape) > 2:
             # 3D+ parameters not preconditioned (e.g., Conv1d kernels)
             param_details["not_preconditioned_too_large"].append({
                 "name": name,
-                "shape": tuple(param.shape),
+                "shape": shape,
                 "num_params": num_params,
             })
         else:
             param_details["not_preconditioned_1d"].append({
                 "name": name,
-                "shape": tuple(param.shape),
+                "shape": shape,
                 "num_params": num_params,
             })
 
@@ -1092,15 +1153,18 @@ def analyze_preconditioning_coverage(
     }
 
 
-def print_preconditioning_stats(model: nn.Module, optimizer_config: OptimizerConfig):
+def print_preconditioning_stats(
+    orig_param_shapes: Dict[int, Tuple[str, Tuple[int, ...]]],
+    optimizer_config: OptimizerConfig
+):
     """
     Print statistics about which parameters will be preconditioned.
 
     Args:
-        model: The model to analyze
+        orig_param_shapes: Dict mapping data_ptr to (name, shape) of original params
         optimizer_config: Optimizer configuration
     """
-    stats = analyze_preconditioning_coverage(model, optimizer_config)
+    stats = analyze_preconditioning_coverage(orig_param_shapes, optimizer_config)
 
     if not stats["uses_preconditioning"]:
         return

@@ -15,7 +15,7 @@ import time
 import json
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from contextlib import nullcontext
 from functools import partial
 
@@ -101,12 +101,14 @@ def setup_model(
     nsa_block_size: int = 64,
     nsa_window_size: int = 64,
     nsa_num_selected_blocks: int = 16,
-) -> Tuple[nn.Module, str]:
+    rope_theta: float = 100000.0,
+) -> Tuple[nn.Module, str, Dict[int, Tuple[str, Tuple[int, ...]]]]:
     """Setup model with optional distributed wrapping.
 
     Returns:
         model: The initialized model
         model_type: String indicating the model type for logging
+        orig_param_shapes: Dict mapping data_ptr to (name, shape) for SOAP preconditioning
     """
     model_type = get_model_type(training_config, block_pattern)
 
@@ -117,6 +119,7 @@ def setup_model(
             mamba_d_conv=mamba_d_conv,
             mamba_expand=mamba_expand,
             mamba_headdim=mamba_headdim,
+            rope_theta=rope_theta,
         )
         model = create_hybrid_model(hybrid_config)
         block_cls = get_block_classes_from_pattern(block_pattern)
@@ -134,6 +137,7 @@ def setup_model(
             nsa_block_size=nsa_block_size,
             nsa_window_size=nsa_window_size,
             nsa_num_selected_blocks=nsa_num_selected_blocks,
+            rope_theta=rope_theta,
         )
         model = create_model(model_config, kernel_type=kernel_type)
         block_cls = {TransformerBlock}
@@ -158,6 +162,12 @@ def setup_model(
         if hasattr(model, 'gradient_checkpointing_enable'):
             model.gradient_checkpointing_enable()
 
+    # Store original parameter shapes before FSDP (for SOAP/Shampoo preconditioning)
+    orig_param_shapes = {}
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            orig_param_shapes[p.data_ptr()] = (name, tuple(p.shape))
+
     # Distributed setup
     if world_size > 1:
         mixed_precision = MixedPrecision(
@@ -171,16 +181,33 @@ def setup_model(
             transformer_layer_cls=block_cls,
         )
 
+        # Sharding strategy selection
+        # - FULL_SHARD: Maximum memory efficiency, but flattens params (breaks SOAP 2D preconditioning)
+        # - SHARD_GRAD_OP: Only shard gradients during backward, keeps full params
+        # - NO_SHARD: No sharding, each GPU has full params (best for SOAP preconditioning)
+        from config import OptimizerType
+        soap_optimizers = {OptimizerType.SOAP, OptimizerType.SOAP_4BIT, OptimizerType.SOAP_8BIT, OptimizerType.SHAMPOO}
+        is_soap = training_config.optimizer_type in soap_optimizers
+
+        # Use SHARD_GRAD_OP for SOAP optimizers - shards gradients but keeps full params
+        if is_soap:
+            sharding_strategy = ShardingStrategy.SHARD_GRAD_OP
+            if rank == 0:
+                print(f"Using SHARD_GRAD_OP for {training_config.optimizer_type.value} preconditioning")
+        else:
+            sharding_strategy = ShardingStrategy.FULL_SHARD
+
         model = FSDP(
             model,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            sharding_strategy=sharding_strategy,
             mixed_precision=mixed_precision,
             auto_wrap_policy=auto_wrap_policy,
             backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
             device_id=rank,
+            use_orig_params=True,  # Preserve original param shapes for SOAP/Shampoo
         )
 
-    return model, model_type
+    return model, model_type, orig_param_shapes
 
 
 def train_step(
@@ -321,36 +348,93 @@ def save_checkpoint(
     output_dir: str,
     rank: int,
     model_type: str = "transformer",
+    world_size: int = 1,
 ):
-    """Save training checkpoint"""
-    if rank != 0:
-        return
-
+    """Save training checkpoint with FSDP-native state dict support"""
     checkpoint_dir = Path(output_dir) / f"checkpoint-{step}"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get model state dict (handle DDP/FSDP)
-    if isinstance(model, (DDP, FSDP)):
-        model_state = model.module.state_dict()
+    # Check if using a custom optimizer with non-standard state (SOAP, Shampoo)
+    # These optimizers have quantized Kronecker factors that don't work with FSDP's
+    # optim_state_dict transformation - save directly instead
+    optimizer_type_val = config.optimizer_type.value
+    is_custom_optim = optimizer_type_val in ("soap4bit", "soap8bit", "shampoo", "soap")
+
+    # For FSDP, use native state dict APIs for proper sharding
+    if isinstance(model, FSDP):
+        from torch.distributed.fsdp import (
+            FullStateDictConfig,
+            StateDictType,
+            FullOptimStateDictConfig,
+        )
+
+        # Gather full state dict on rank 0
+        full_state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        full_optim_config = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            full_state_config,
+            full_optim_config,
+        ):
+            model_state = model.state_dict()
+            # For custom optimizers, save state directly (not through FSDP transformation)
+            if is_custom_optim:
+                optim_state = optimizer.state_dict()
+            else:
+                optim_state = FSDP.optim_state_dict(model, optimizer)
+
+        if rank == 0:
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(model_state, checkpoint_dir / "model.pt")
+            torch.save(optim_state, checkpoint_dir / "optimizer.pt")
+            torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+
+            with open(checkpoint_dir / "config.json", "w") as f:
+                json.dump({
+                    "step": step,
+                    "model_type": model_type,
+                    "model_size": config.model_size,
+                    "attention_type": config.attention_type.value,
+                    "optimizer_type": config.optimizer_type.value,
+                    "max_seq_length": config.max_seq_length,
+                    "fsdp": True,
+                    "custom_optim": is_custom_optim,
+                }, f, indent=2)
+
+            print(f"Saved FSDP checkpoint to {checkpoint_dir}")
+
+        # Synchronize all ranks after checkpoint
+        if world_size > 1:
+            dist.barrier()
     else:
-        model_state = model.state_dict()
+        # Non-FSDP: only save from rank 0
+        if rank != 0:
+            return
 
-    torch.save(model_state, checkpoint_dir / "model.pt")
-    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
-    torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save config
-    with open(checkpoint_dir / "config.json", "w") as f:
-        json.dump({
-            "step": step,
-            "model_type": model_type,
-            "model_size": config.model_size,
-            "attention_type": config.attention_type.value,
-            "optimizer_type": config.optimizer_type.value,
-            "max_seq_length": config.max_seq_length,
-        }, f, indent=2)
+        if isinstance(model, DDP):
+            model_state = model.module.state_dict()
+        else:
+            model_state = model.state_dict()
 
-    print(f"Saved checkpoint to {checkpoint_dir}")
+        torch.save(model_state, checkpoint_dir / "model.pt")
+        torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+        torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
+
+        with open(checkpoint_dir / "config.json", "w") as f:
+            json.dump({
+                "step": step,
+                "model_type": model_type,
+                "model_size": config.model_size,
+                "attention_type": config.attention_type.value,
+                "optimizer_type": config.optimizer_type.value,
+                "max_seq_length": config.max_seq_length,
+                "fsdp": False,
+            }, f, indent=2)
+
+        print(f"Saved checkpoint to {checkpoint_dir}")
 
 
 def load_checkpoint(
@@ -358,20 +442,77 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     checkpoint_dir: str,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> int:
-    """Load training checkpoint"""
+    """Load training checkpoint with FSDP-native state dict support"""
     checkpoint_dir = Path(checkpoint_dir)
-
-    if isinstance(model, (DDP, FSDP)):
-        model.module.load_state_dict(torch.load(checkpoint_dir / "model.pt"))
-    else:
-        model.load_state_dict(torch.load(checkpoint_dir / "model.pt"))
-
-    optimizer.load_state_dict(torch.load(checkpoint_dir / "optimizer.pt"))
-    scheduler.load_state_dict(torch.load(checkpoint_dir / "scheduler.pt"))
 
     with open(checkpoint_dir / "config.json", "r") as f:
         config = json.load(f)
+
+    is_fsdp_checkpoint = config.get("fsdp", False)
+
+    # Check if using a custom optimizer with non-standard state (SOAP, Shampoo)
+    # These optimizers have quantized Kronecker factors that don't work with FSDP's
+    # optim_state_dict_to_load transformation
+    optimizer_type = config.get("optimizer_type", "")
+    is_custom_optim = optimizer_type in ("soap4bit", "soap8bit", "shampoo", "soap")
+
+    if isinstance(model, FSDP):
+        from torch.distributed.fsdp import (
+            FullStateDictConfig,
+            StateDictType,
+            FullOptimStateDictConfig,
+        )
+
+        # For rank0_only=False, all ranks need to participate in load_state_dict
+        # This is required for proper FSDP state dict loading
+        full_state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+        full_optim_config = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=False)
+
+        # All ranks load the state dict (required for FSDP)
+        model_state = torch.load(checkpoint_dir / "model.pt", map_location="cpu")
+        optim_state = torch.load(checkpoint_dir / "optimizer.pt", map_location="cpu")
+
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            full_state_config,
+            full_optim_config,
+        ):
+            # All ranks load model state for proper FSDP distribution
+            model.load_state_dict(model_state)
+
+            # For custom optimizers (SOAP/Shampoo) with FSDP, optimizer state
+            # loading is unreliable due to parameter ordering differences across
+            # ranks and sessions. Skip optimizer state and reinitialize.
+            if is_custom_optim:
+                if rank == 0:
+                    print(f"Note: {optimizer_type} optimizer state not loaded with FSDP "
+                          "(parameter ordering mismatch). Training will continue with "
+                          "reinitialized momentum/preconditioner states.")
+                # Don't load optimizer state - let it reinitialize
+            elif is_fsdp_checkpoint:
+                # Standard optimizers: use FSDP's native API
+                optim_state_to_load = FSDP.optim_state_dict_to_load(
+                    model, optimizer, optim_state
+                )
+                optimizer.load_state_dict(optim_state_to_load)
+            else:
+                # Legacy checkpoint without FSDP state dict
+                optimizer.load_state_dict(optim_state)
+
+        scheduler.load_state_dict(torch.load(checkpoint_dir / "scheduler.pt"))
+    else:
+        # Non-FSDP loading
+        if isinstance(model, DDP):
+            model.module.load_state_dict(torch.load(checkpoint_dir / "model.pt"))
+        else:
+            model.load_state_dict(torch.load(checkpoint_dir / "model.pt"))
+
+        optimizer.load_state_dict(torch.load(checkpoint_dir / "optimizer.pt"))
+        scheduler.load_state_dict(torch.load(checkpoint_dir / "scheduler.pt"))
 
     return config["step"]
 
@@ -390,6 +531,7 @@ def train(
     nsa_block_size: int = 64,
     nsa_window_size: int = 64,
     nsa_num_selected_blocks: int = 16,
+    rope_theta: float = 100000.0,
 ):
     """Main training function"""
     # Setup distributed
@@ -435,7 +577,7 @@ def train(
             print(f"Setting up Transformer model: {config.model_size} "
                   f"with {config.attention_type.value} (kernel={kernel_type})")
 
-    model, model_type = setup_model(
+    model, model_type, orig_param_shapes = setup_model(
         config, rank, world_size, block_pattern, block_repeats, kernel_type,
         ce_kernel_type=ce_kernel_type,
         mamba_d_state=mamba_d_state,
@@ -445,6 +587,7 @@ def train(
         nsa_block_size=nsa_block_size,
         nsa_window_size=nsa_window_size,
         nsa_num_selected_blocks=nsa_num_selected_blocks,
+        rope_theta=rope_theta,
     )
 
     # Count parameters
@@ -464,13 +607,18 @@ def train(
         learning_rate=config.optimizer_config.learning_rate if config.optimizer_config else 1e-4,
     )
 
-    # Unwrap model for optimizer
-    model_for_opt = model.module if isinstance(model, (DDP, FSDP)) else model
-    optimizer = create_optimizer(model_for_opt, optimizer_config, world_size)
+    # For FSDP, use wrapped model (flat params); for DDP, unwrap is fine
+    if isinstance(model, FSDP):
+        model_for_opt = model  # FSDP requires optimizer on wrapped model
+    elif isinstance(model, DDP):
+        model_for_opt = model.module
+    else:
+        model_for_opt = model
+    optimizer = create_optimizer(model_for_opt, optimizer_config, world_size, orig_param_shapes)
 
     # Print preconditioning coverage for SOAP/Shampoo optimizers
     if is_main:
-        print_preconditioning_stats(model_for_opt, optimizer_config)
+        print_preconditioning_stats(orig_param_shapes, optimizer_config)
 
     # Setup scheduler
     scheduler = get_lr_scheduler(
@@ -501,7 +649,7 @@ def train(
     # Resume from checkpoint
     start_step = 0
     if resume_from:
-        start_step = load_checkpoint(model, optimizer, scheduler, resume_from)
+        start_step = load_checkpoint(model, optimizer, scheduler, resume_from, rank, world_size)
         if is_main:
             print(f"Resumed from step {start_step}")
 
@@ -552,9 +700,10 @@ def train(
                 elapsed = time.time() - start_time
                 # Divide by number of batches (log_interval * gradient_accumulation_steps)
                 avg_loss = running_loss / (config.log_interval * config.gradient_accumulation_steps)
+                # Tokens processed = log_interval steps * grad_accum_steps * batch_size * world_size * seq_length
                 tokens_per_sec = (
                     config.batch_size * config.max_seq_length *
-                    config.log_interval * world_size
+                    config.log_interval * config.gradient_accumulation_steps * world_size
                 ) / elapsed
 
                 log_str = (
@@ -586,12 +735,14 @@ def train(
                 save_checkpoint(
                     model, optimizer, scheduler, step,
                     config, str(output_dir), rank, model_type=model_type,
+                    world_size=world_size,
                 )
 
     # Final save
     save_checkpoint(
         model, optimizer, scheduler, step,
         config, str(output_dir), rank, model_type=model_type,
+        world_size=world_size,
     )
 
     if use_wandb and is_main:
@@ -636,8 +787,12 @@ def parse_args():
                        help="NSA block size for sparse attention")
     parser.add_argument("--nsa_window_size", type=int, default=64,
                        help="NSA window size for local attention")
-    parser.add_argument("--nsa_num_selected_blocks", type=int, default=16,
+    parser.add_argument("--nsa_num_selected_blocks", type=int, default=32,
                        help="NSA number of top-k blocks to attend to")
+
+    # RoPE parameters
+    parser.add_argument("--rope_theta", type=float, default=500000.0,
+                       help="RoPE theta base frequency")
 
     # Kernel type
     parser.add_argument("--kernel_type", type=str, default="liger",
@@ -658,7 +813,7 @@ def parse_args():
     # Training parameters
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--num_train_steps", type=int, default=10000)
+    parser.add_argument("--num_train_steps", type=int, default=20000)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("-lr","--learning_rate", type=float, default=1e-4)
     parser.add_argument("-wd","--weight_decay", type=float, default=0.1)
@@ -778,6 +933,7 @@ def main():
         nsa_block_size=args.nsa_block_size,
         nsa_window_size=args.nsa_window_size,
         nsa_num_selected_blocks=args.nsa_num_selected_blocks,
+        rope_theta=args.rope_theta,
     )
 
 
